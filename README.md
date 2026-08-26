@@ -7,7 +7,9 @@ Qwen3-0.6B **directly from GGUF** on an Axera AX8850 NPU accelerator card
 **The GGUF is the only model artifact** — weights stream from the GGUF into NPU engines
 at load time. Q8_0 and Q4_K_M quants both work from the same code path.
 
-- Current speed: ~1.3-2.7 t/s decode (see "Architecture" for why)
+- Whole-layer mode (`GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`): **7.6-8.3 t/s** decode
+  and prefill, coherent output, 28 NPU calls/token (one per layer)
+- Legacy per-op mode: ~1.3-2.7 t/s decode
 - Vendor reference, same card + model: 13.5-16.9 t/s (baked weights, closed runtime)
 - Code: branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8` on
   `github.com/woolcoxm/llama.cpp`
@@ -106,18 +108,20 @@ Engines (dev machine, x86): compiled with Pulsar2 from `gemm/` ONNX sources
   concurrent engine execution — untapped.
 - Full card utilization comes from the whole-layer engines, not multi-core compilation.
 
-## Offload roadmap (everything-on-NPU)
+## Offload roadmap
 
-1. **Chain mode everywhere** (done, default off): elementwise ops as NPU engines.
-2. **Matmul device-pipelining**: bind X from device-resident chain buffers (the
-   `g_chain_x_override` mechanism) for all projections — removes H2D per call.
-3. **Attention engine for all context lengths**: device KV cache with watermark
-   uploads (exists; activation gate needs fixing — currently requires seq > 128).
-4. **Whole-layer engines**: vendor-class 28 calls/token. Weight layout fully
-   reverse-engineered and verified (int4 nibble pairs, complete position table —
-   `gemm/layer_layout_v3.pkl`); remaining: scale-table mapping, weight-patching
-   loader via `axclrtEngineLoadFromMem`, backend integration. Full log:
-   `NOTES-DYNAMIC-WEIGHTS.md`.
+1. ~~Chain mode~~ (works, superseded by whole-layer mode).
+2. **Whole-layer engines: WORKING** (`GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`).
+   Templates from `pulsar2 llm_build` live in `/usr/local/share/ggml-axcl/layer/`
+   (28 engines, bf16 weights, 2048 ctx — `gemm/baked/`). The engine chain,
+   mask/indices conventions, KV scatter and output delivery are validated
+   against a numpy reference layer-by-layer. NOTE: `-w s8` templates store
+   INT4 weights whose accumulated drift garbles generation — use `-w bf16`.
+3. **Dynamic GGUF weights**: patch GGUF weights into template engines at load
+   (the cracked layout + scale tables) — in progress; `axclrtEngineLoadFromMem`
+   hangs in driver V3.6.5, patched engines load via temp files instead.
+4. Prefill ladder (engine shape groups m=128), post engine (NPU logits),
+   multi-core/VNPU.
 
 ## Troubleshooting
 
