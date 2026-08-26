@@ -12,3 +12,5 @@ gemm/*.npz
 *.gguf
 *.img.xz
 build_context.json
+*.pkl
+gemm/baked/
