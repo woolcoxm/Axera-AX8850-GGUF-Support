@@ -10,11 +10,15 @@ export PATH=/home/kram/Desktop/Projects/LLMTest/pulsar2/p7p/ax_pulsar2_7.0_patch
 # snapshot existing dumps so parallel runs never steal each other's files
 BEFORE=$(ls /tmp/qam_dump_*.onnx 2>/dev/null || true)
 
-/usr/bin/python3 $GEMM/mk_diff_marker.py /tmp/${TAG} ${VARIANT}
+case "$VARIANT" in
+  cm*) GEN=mk_code_marker.py; VARG=$(echo $VARIANT | tr -d 'cm') ;;
+  *)   GEN=mk_diff_marker.py; VARG=$VARIANT ;;
+esac
+/usr/bin/python3 $GEMM/$GEN /tmp/${TAG} ${VARG}
 FLOAT_MATMUL_USE_CONV_EU=1 pulsar2 llm_build \
   --input_path /tmp/${TAG} --output_path /tmp/${TAG}_out \
-  --hidden_state_type bf16 --kv_cache_len 256 --prefill_len 128 \
-  --last_kv_cache_len 128 --chip AX650 -c 0 --parallel 8 -w s8 \
+  --hidden_state_type bf16 --kv_cache_len ${CTX:-256} --prefill_len 128 \
+  --last_kv_cache_len 128 --chip AX650 -c 0 --parallel 8 -w ${WT:-s8} \
   > /tmp/${TAG}.log 2>&1
 
 /usr/bin/python3 - $TAG "$BEFORE" <<'EOF'

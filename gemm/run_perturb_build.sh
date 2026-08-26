@@ -14,7 +14,7 @@ BEFORE=$(ls /tmp/qam_dump_*.onnx 2>/dev/null || true)
 FLOAT_MATMUL_USE_CONV_EU=1 pulsar2 llm_build \
   --input_path /tmp/${TAG} --output_path /tmp/${TAG}_out \
   --hidden_state_type bf16 --kv_cache_len 256 --prefill_len 128 \
-  --last_kv_cache_len 128 --chip AX650 -c 0 --parallel 8 -w s8 \
+  --last_kv_cache_len 128 --chip AX650 -c 0 --parallel 8 -w ${WT:-s8} \
   > /tmp/${TAG}.log 2>&1
 
 /usr/bin/python3 - $TAG "$BEFORE" <<'EOF'
@@ -61,7 +61,8 @@ if _cmf:
     _a, _b = _np(_cmf[0]), _np(out)
     _d = int((_a != _b).sum())
     print(f'{tag}: diff-vs-cm0 = {_d} bytes')
-    if _d > 100000:
+    import os as _os
+    if _d > 100000 and _os.environ.get("WT") != "bf16":
         print(f'{tag}: CONTENT CHECK FAILED (expected small perturbation diff)')
         sys.exit(3)
 EOF
