@@ -133,3 +133,63 @@ scale tables (format TBD) -> axclrtEngineLoadFromMem.
 - IMPORTANT: weights are 4-BIT in these engines (even with -w s8?!). Accuracy check needed
   vs vendor w8a16 build (their blob had 15.4MB int8-looking mass; ours 7.7M nibble+7.7 meta).
   Reconsider: maybe -w s8 got ignored for layers, or 4-bit + 8-bit-meta = w8 effective.
+
+## WHOLE-LAYER ENGINES WORKING (2026-08-26 mid-day) — 7.6-8.3 t/s coherent
+
+`GGML_AXCL_LAYER=1 GGML_AXCL_FA=1` on the Pi: 28 engine calls/token,
+device-resident bf16 hidden chain, per-layer device KV caches. Prefill runs
+the engine per token (autoregressive loop) — 8.1-8.3 t/s, ~3.5x faster than
+the legacy per-op prefill. Committed: llama.cpp 5e2b590.
+
+### Engine conventions (all validated vs numpy, layer by layer)
+- mask [1,1,2049] bf16: slots [0..2047] = caller cache, slot 2048 = the
+  engine's internal SELF row. Row p: allow t<p plus t==T.
+- indices u32: rope position + cache write slot.
+- K_cache_out/V_cache_out [1,1,1024]: the new token's rows — caller scatters
+  (D2D) into its cache copy and write-backs to the host cache.
+- The runtime MISHANDLES sub-buffer bindings (offset into a table) for both
+  mask and indices: refresh dedicated buffers' contents per call instead.
+- Uninitialized device caches: NaN-shaped garbage poisons the softmax
+  THROUGH the -inf mask (NaN + -inf = NaN). Zero-fill at alloc.
+- The engine must never read its input from the buffer it writes
+  (double-buffer the hidden yout).
+- axclrtEngineLoadFromMem hangs (unmodified bytes!) in V3.6.5 — use temp
+  file + LoadFromFile.
+
+### llama.cpp integration shape (the hard-won parts)
+- The scheduler only delivers the decode graph unsplit when (a) metadata
+  ops are claimed AND (b) FLASH_ATTN_EXT is claimed (any claim flips
+  llama.cpp onto its FA graph path; unclaimed = manual attention which the
+  scheduler splits at every attention matmul because CPU owns the KV buft).
+- THE FA HOST-OP IS STILL WRONG (engine route AND scalar fallback produce
+  wrong outputs on real graphs) — claiming FA is safe ONLY because armed
+  graphs skip the node entirely (subsumed by the layer engine).
+- Output delivery: the graph's LAST residual ADD is the fragment output;
+  backfill the engine hidden there and disarm IN-LOOP so the final
+  RMS_NORM + weight MUL (in the same fragment!) compute via host ops; the
+  vocab matmul stays on CPU.
+- First-RMS_NORM-after-anchors = layer 27's post-attention norm (trap!).
+- Cache-base detection for resync: [1024, >=ctx, <=8192] excludes the
+  embedding/lm_head tables which match the same shape filter.
+
+### Weight dtype (the garbage-output root cause)
+- `-w s8` templates store INT4 weights: 3%/layer drift vs f32 reference,
+  garbling generation. The chain-vs-numpy harness quantified it cleanly.
+- `-w bf16` templates: coherent everywhere (28x66MB, DRAM-bound 3.2ms/layer).
+- fp8_e4m3 under test (would halve weight reads; quality borderline).
+
+### Layout research state (dynamic GGUF loader)
+- layer_layout_v3.pkl VINDICATED: pq16 (+16 code shift) probes put exactly
+  128/128 nibble bytes on the probed group's claimed positions. Earlier
+  zero-hit results were dump-collection races — serial builds + content
+  checks added to run_perturb_build.sh.
+- Sign semantics: nibble = (q8>>4)+8 ARITHMETIC shift; hi nibble = odd k,
+  lo = even k (NOTES' earlier claim was inverted).
+- Scales: [i16 516][bf16 s] entries, per (row, kgroup-256); value =
+  bf16(groupmax/127); 30,700 slots reconstruct EXACTLY (RNE) vs sdA.
+- Norm folding: llm_build FOLDS norm gains into the projection weights
+  (nw marker changed 16M blob bytes; templates must be built with the
+  target model's norms or the loader must fold GGUF norms before quant).
+- REMAINING for patch-at-load: the second weight representation (the
+  non-nibble region is load-bearing per acid test 2), scale slot map
+  completion (sdc2/sdc3 dumps were collection-poisoned; rebuild serially).
