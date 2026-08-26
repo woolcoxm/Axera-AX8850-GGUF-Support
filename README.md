@@ -7,8 +7,11 @@ Qwen3-0.6B **directly from GGUF** on an Axera AX8850 NPU accelerator card
 **The GGUF is the only model artifact** — weights stream from the GGUF into NPU engines
 at load time. Q8_0 and Q4_K_M quants both work from the same code path.
 
-- Whole-layer mode (`GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`): **7.6-8.3 t/s** decode
-  and prefill, coherent output, 28 NPU calls/token (one per layer)
+- Dynamic-GGUF whole-layer mode (`GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`):
+  **7.5-8.3 t/s**, coherent, the GGUF's own weights patched into template engines
+  at load (12/12 E2E pass incl. 1800-token prompts, unicode, emoji)
+- Baked-weights whole-layer mode (`GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`): same speed,
+  template weights (HF f32-derived)
 - Legacy per-op mode: ~1.3-2.7 t/s decode
 - Vendor reference, same card + model: 13.5-16.9 t/s (baked weights, closed runtime)
 - Code: branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8` on
@@ -89,6 +92,10 @@ Engines (dev machine, x86): compiled with Pulsar2 from `gemm/` ONNX sources
 
 | Var | Effect |
 |---|---|
+| `GGML_AXCL_GGUF` | patch whole-layer engines from the GGUF's weights at load |
+| `GGML_AXCL_GGUF_DIR` | cache dir for patched engines (default /tmp/axcl-gguf) |
+| `GGML_AXCL_LAYOUT` | layout sidecar path (default .../layer/layout_v4.bin) |
+| `GGML_AXCL_LAYER` | whole-layer engine mode (1 call/layer/token) |
 | `GGML_AXCL_CHAIN` | device-resident chain mode (norm/add/glu on NPU) |
 | `GGML_AXCL_CHAIN_OPS` | gate chain routes (`norm,add,glu`) |
 | `GGML_AXCL_QKV_X` | cross-fragment QKV fusion (default off — see above) |
@@ -117,9 +124,11 @@ Engines (dev machine, x86): compiled with Pulsar2 from `gemm/` ONNX sources
    mask/indices conventions, KV scatter and output delivery are validated
    against a numpy reference layer-by-layer. NOTE: `-w s8` templates store
    INT4 weights whose accumulated drift garbles generation — use `-w bf16`.
-3. **Dynamic GGUF weights**: patch GGUF weights into template engines at load
-   (the cracked layout + scale tables) — in progress; `axclrtEngineLoadFromMem`
-   hangs in driver V3.6.5, patched engines load via temp files instead.
+3. ~~Dynamic GGUF weights~~ **WORKING** (`GGML_AXCL_GGUF=1`): the bf16-template
+   layout was cracked by value-anchored search (every weight = raw bf16 at a
+   fixed file offset — `gemm/layout_v4.bin`, byte-exact vs baked engines);
+   the loader dequants GGUF rows, scatters, loads patched files. No compile,
+   no model re-making; any Qwen3-0.6B-family GGUF works.
 4. Prefill ladder (engine shape groups m=128), post engine (NPU logits),
    multi-core/VNPU.
 

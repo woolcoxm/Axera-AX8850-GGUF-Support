@@ -193,3 +193,30 @@ the legacy per-op prefill. Committed: llama.cpp 5e2b590.
 - REMAINING for patch-at-load: the second weight representation (the
   non-nibble region is load-bearing per acid test 2), scale slot map
   completion (sdc2/sdc3 dumps were collection-poisoned; rebuild serially).
+
+## DYNAMIC GGUF WORKING (2026-08-26 evening) — commits ce07a2f + 567a973
+
+`GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1`: the GGUF's own weights
+run through the whole-layer engines. 12/12 E2E pass. q8_0 + Q4_K_M verified.
+
+### The bf16-template crack (completely different from the s8 nibble maze)
+- `-w bf16` templates store weights as RAW bf16: no norm folding, no quant
+  transform, no scale entries. l0+l1-weights repatch = baked l1 minus 3
+  layer-index microcode bytes (65164243/65355556/65607129) — and patched
+  engines compute IDENTICALLY to baked (on-card acid test, 0.0 diff).
+- Layout decoded by VALUE-ANCHORED SEARCH (anchor_real_layout.py): for every
+  matrix row, find its first-6-values bf16 sequence at stride 64 in the
+  engine blob -> 100% of rows anchored for all 7 matrices (15.73M elements).
+- Norm slots (input/post/q_norm/k_norm, 2304 entries) + down-tail (2687)
+  via l0-vs-l1 diff windows + value-triple matching.
+- Sidecar: gemm/layout_v4.bin (AXL4: u64 byte offsets per element).
+
+### Backend loader
+- Registry: prescan stashes leaf tensors per layer. GOTCHAS: node order is
+  q,v,k (k's norm/rope chain longer) -> k = lower address of the 1024x1024
+  pair; norm gains matched via RMS_NORM-linked MULs; o/down by shape.
+- Swap timing is CRITICAL: patch+swap inside the FIRST armed graph's
+  prescan, before any node runs. Swapping one graph later = prefill on
+  template weights = mixed-model KV caches = degenerate output.
+- The 28 template engines are unloaded (axclrtEngineUnload) before the
+  patched set loads; patched files cached in /tmp/axcl-gguf.
