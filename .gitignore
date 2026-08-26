@@ -1,0 +1,14 @@
+pulsar2/
+vendor/
+axcl-samples/
+Qwen3-0.6B/
+build-pc/
+driver-good/
+bookworm-lite.img.xz
+gemm/layout_artifacts/
+gemm/*.axmodel
+gemm/*.onnx
+gemm/*.npz
+*.gguf
+*.img.xz
+build_context.json
