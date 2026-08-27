@@ -19,3 +19,19 @@ gemm/baked/v52_markers/
 posts/
 gemm/baked/out/
 __pycache__/
+
+# int4lab research scratch (big blobs, builds, probe outputs)
+int4lab/scratch/
+int4lab/build1/
+int4lab/dyn_out/
+int4lab/wheels/
+int4lab/pyoverlay/
+int4lab/__pycache__/
+int4lab/hooks/__pycache__/
+int4lab/*.onnx
+int4lab/*.log
+int4lab/*.npy
+int4lab/*.out
+int4lab/code_dump*.txt
+int4lab/disasm.txt
+int4lab/hf_api.json
