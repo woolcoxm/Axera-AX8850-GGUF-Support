@@ -220,3 +220,75 @@ run through the whole-layer engines. 12/12 E2E pass. q8_0 + Q4_K_M verified.
   template weights = mixed-model KV caches = degenerate output.
 - The 28 template engines are unloaded (axclrtEngineUnload) before the
   patched set loads; patched files cached in /tmp/axcl-gguf.
+
+## THROUGHPUT SESSION (2026-08-26 night) — 7.9 -> 19.6 t/s decode
+
+### Baseline measurement (per-token budget at 7.96 t/s = 125.6 ms/tok)
+- engine execute: 3.235 ms/layer avg (us accumulator delta over 3500 calls) -> 90.6 ms
+- host-side: ~35 ms (28x [4B idx H2D from STACK + 7 binds + 4KB mask D2D +
+  2x 2KB D2D scatter + 2x 2KB D2H writeback + scalar bf16->f16 loops])
+- KEY: unpinned small transfers cost ~1ms each on this stack (page pinning
+  per transfer) — the idx/row stack buffers were the dominant host cost.
+- "0.21 t/s prefill" in short-prompt runs is engine swap cost billed to
+  prompt-eval by llama-simple; not per-token.
+
+### Host optimization pass (items: call diet + KV defer + NEON + pinned)
+- per-TOKEN (not per-layer) idx upload + mask-row D2D (synced_pos guard)
+- static IO bindings once per engine (K/V/idx/mask); only hidden ping-pong
+  + K/V rows rebind per call; K/V outputs bound DIRECTLY into cache rows
+  (2KB aligned; mask protects the row from same-call reads) -> both D2D
+  scatters gone (GGML_AXCL_KV_INPLACE=0 restores old path)
+- host KV write-back DEFERRED via host_wm[l] watermark (flush at resync /
+  every 32 pos / non-armed graph entry / bail; batched contiguous D2H into
+  pinned 64-row staging). GGML_AXCL_KVWB=now restores per-call writes.
+- NEON bf16<->f32 helpers (axcl_bf16_to_f32 / axcl_f32_to_bf16)
+- pinned staging for idx/rows/hidden/logits (304KB logits D2H was unpinned
+  std::vector)
+- RESULT: 9.91 t/s (100.9 ms/tok; host 35 -> 10.5 ms). E2E 12/12 PASS.
+
+### Weight dtype dead ends (measured, not guessed)
+- -w fp8_e4m3 full build: engines SAME size (65.6MB), SAME speed (9.94 t/s,
+  90.1ms eng) — flag changes blob packing, not card-side cost. Layer path
+  is NOT a "same pipeline, fewer bytes" situation.
+- --post_weight_type fp8_e4m3: post engine 621MB (bigger than s8's 170MB).
+- s4 post: not an accepted choice for --post_weight_type.
+- post engine is s8 by default already (169.7MB); NOT GGUF-patched (runs
+  template lm_head; part of the 94% agreement gap).
+
+### The real decode win: vendor w8a16 engines
+- ~/Qwen3-0.6B engines: 23.1MB/layer (int8 path) vs our 65.6MB bf16
+- SAME filenames + IO conventions -> just GGML_AXCL_LAYER_DIR=~/Qwen3-0.6B
+- 1.51 ms/layer -> 52.9 ms/tok, 18.9 t/s; +GGML_AXCL_STREAM=1 (28 execs
+  async on one stream, sync after layer 27) -> 19.5 t/s
+- FINAL: 19.6 t/s decode. BEATS vendor closed runtime (13.48 measured).
+- E2E 12/12 PASS on this mode too. Governor=performance on Pi.
+
+### Prefill chunk ladder: fully mapped, PROVEN UNUSABLE on axcl V3.6.5
+- Vendor engines have 10 shape groups. group 0 = decode m=1; groups 1..9 =
+  128-token chunks, prefix ladder 0..1024:
+  g1: K/V [1,1,1024](dummy), idx [1,128], in [1,128,1024], mask [1,128,128]
+  g(n>1): K/V [1,(n-1)*128,1024], mask [1,128,(n-1)*128+128]
+- size API (axclrtEngineGetInputSizeByIndex(info,g,i)) matches dims products.
+- test_chunk.c harness (per-token reference vs single group-1 call):
+  K_out differs even with identical x + rope 0 (max diff 139; K is a pure
+  function of x+pos — cannot be a convention issue we control).
+- ONE-HOT test: zeroing 127/128 input rows leaves output essentially
+  unchanged -> the engine IGNORES the bound input for chunk groups.
+- Runtime logs internal "[memory][memcpy] nil pointer" on chunk executes.
+- Vendor's OWN host runtime never calls groups != 0 (LD_PRELOAD trace of
+  main_axcl_aarch64 on a 300-token prompt: 18089x GROUP=0, zero others).
+- Chunk path kept behind GGML_AXCL_BATCH=1 (defaults off). Per-token
+  prefill through group 0 with vendor engines: ~55 t/s steady (3.9x the
+  14 t/s at session start; ~4x vendor runtime's own prefill).
+
+### Misc
+- vNPU = runtime NPU partitioning (axclrtEngineInit kind DISABLE/STD/
+  BIG_LITTLE/LITTLE_BIG). We use AXCL_VNPU_DISABLE = full NPU — correct
+  for single-stream; partitioning only matters for multi-process tenants.
+- pulsar2 --npu_mode {NPU1,NPU2,NPU3} is the compile-time core selection;
+  -c is check_level (not cores). Default build = all cores. NPU1 build
+  matrix untested (low expected value while DRAM-bound).
+- sitecustomize.py tensor-dump hook was filling /tmp (tmpfs 16G) ->
+  Errno 122 on builds; disabled (kept as .research-disabled).
+- Killed runs can wedge the card (PCIe DMA errors on next load) — reboot
+  the Pi to recover; governor resets to ondemand (set performance).

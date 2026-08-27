@@ -16,9 +16,19 @@ bench "legacy     " ""
 bench "layer-baked" "GGML_AXCL_LAYER=1 GGML_AXCL_FA=1"
 bench "gguf-dyn   " "GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1"
 bench "gguf-q4    " "GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1" qwen3-q4km
+# vendor w8a16 engine set (int8 NPU path) — fastest mode
+VDIR=${GGML_AXCL_LAYER_DIR:-$HOME/Qwen3-0.6B}
+if [ -d "$VDIR" ]; then
+    VENV="GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 GGML_AXCL_LAYER_DIR=$VDIR GGML_AXCL_POST_MODEL=$VDIR/qwen3_post.axmodel"
+    bench "vendor-q8  " "$VENV"
+    bench "vendor-q4  " "$VENV" qwen3-q4km
+else
+    echo "  (vendor engine dir $VDIR not present — skipping vendor modes)"
+fi
 
-echo "===== 2) MEMORY during decode (gguf-dyn) ====="
-(env GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 timeout 120 $BIN -m ~/models/qwen3-q8.gguf -n 2000 "x" >/dev/null 2>&1 &)
+echo "===== 2) MEMORY during decode (vendor mode) ====="
+VDIR=${GGML_AXCL_LAYER_DIR:-$HOME/Qwen3-0.6B}
+(env GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 GGML_AXCL_LAYER_DIR=$VDIR GGML_AXCL_POST_MODEL=$VDIR/qwen3_post.axmodel timeout 120 $BIN -m ~/models/qwen3-q8.gguf -n 2000 "x" >/dev/null 2>&1 &)
 sleep 75
 PID=$(pgrep -x llama-simple | head -1)
 if [ -n "$PID" ]; then
