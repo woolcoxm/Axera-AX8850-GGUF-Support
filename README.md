@@ -30,6 +30,12 @@ outperforms the vendor's own closed-source runtime (13.5–14.5 t/s measured
 on the same card) — running llama.cpp, straight from GGUF, on a Raspberry
 Pi 5.**
 
+Fidelity (greedy prefix-token agreement vs the CPU reference of the same
+GGUF, 10 prompts × 24 tokens): vendor-engine mode q8_0 **94%** / Q4_K_M
+**90%**; dynamic-GGUF mode q8_0 **91%** / Q4_K_M **93%**. Divergence is
+near-tie tokens under different weight numerics (int8/bf16 engines vs the
+reference), not gross corruption.
+
 ## Quick start
 
 On the **Pi** (kram@10.0.0.81 in this setup; any aarch64 host with the AXCL
