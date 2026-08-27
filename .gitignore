@@ -15,3 +15,5 @@ build_context.json
 *.pkl
 gemm/baked/
 gemm/layout_v4.bin
+gemm/baked/v52_markers/
+posts/
