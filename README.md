@@ -11,7 +11,7 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
-| **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 17.5 t/s | **~0%** | **1.1 GB** |
+| **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 18.1 t/s | **~0%** | **1.1 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
 | Dynamic-GGUF mode (GGUF weights, bf16 engines) | q8_0 | 10.2 t/s | 5.0 t/s | ~5% | 2.4 GB |
@@ -35,7 +35,12 @@ Fidelity (greedy prefix-token agreement vs the CPU reference of the same
 GGUF, 10 prompts × 24 tokens): **GGUF-int8 mode q8_0 96%**; vendor-engine
 mode q8_0 **94%** / Q4_K_M **90%**; dynamic-GGUF mode q8_0 **91%** /
 Q4_K_M **93%**. Divergence is near-tie tokens under different weight
-numerics, not gross corruption.
+numerics, not gross corruption. Known-answer/code/coherence evals
+(`gemm/eval_suite.sh`): GGUF-int8 mode scores 6/8 — the identical
+profile to the CPU reference of the same GGUF (the two shared misses:
+one model near-miss completion, one eval-script quirk that "fails"
+healthy lexical diversity); vendor-engine mode scores 7/8 but diverges
+from the reference on the arithmetic near-miss.
 
 ## Quick start
 
