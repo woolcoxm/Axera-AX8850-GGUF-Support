@@ -525,3 +525,29 @@ Decoder: gemm/decode_v52_numpy.py -> v52_claims.npz + v52_fine.npz.
    pgrep before running suites; re-run failures once the card is free.
 5. axcl-smi lives at /usr/bin/axcl/axcl-smi (not on PATH) on this Pi
    image. CMM baseline 18 MiB.
+
+## BANDWIDTH SESSION (2026-08-27 morning, ZCode) — s4 GO + chunk ladder UNBROKEN
+
+Full details in int4lab/FINDINGS.md "Phase C EXECUTED". Headlines that
+REVISE earlier conclusions in this log:
+
+1. **The chunk ladder was never broken** ("PROVEN UNUSABLE" above is
+   superseded). With all outputs bound to dedicated exact-size buffers, one
+   IO handle per group, and no offset binds, chunk-group K_cache_out is
+   BYTE-EXACT vs per-token decode K for m=8..128 on both vendor and
+   llm_build2 engines. The backend's chunk path failed on its offset output
+   binds (rows written INTO the cache at byte offsets). Caveat: the y
+   (`output`) tensor is only written for m >= 64.
+2. **w8a16 per-layer time decomposes as ~25 GB/s marginal streaming +
+   ~457 µs fixed per call** (two-point fit s4 vs s8). The bus is at ~73% of
+   the 34.1 GB/s peak and is NOT the limiter; per-call fixed cost is (28 x
+   457 µs = 12.8 ms/token at sync; less under the async chain).
+3. **s4 measured: 1166 µs/layer at kv 2047 (vs 1500 vendor w8a16)** →
+   projected ~28-30 t/s decode through the existing backend once pointed at
+   the rebuilt s4 engine set (/tmp/int4lb2/out_s4_2048; scp to Pi).
+4. Post engine: single m=1 group, 7.9 ms/call (~19.6 GB/s pure streaming) —
+   15% of every decode token; vocab trim is the lever.
+5. Decode context tax is small: 19.64 t/s @ ctx60 vs 18.59 @ ctx1580.
+6. --ld_param_opt crashes llm_build2 7.0-patch1 (marker ckpt).
+
+New tools: gemm/phase_c_timing.c, phase_c_refcheck.c, phase_c_onehot.c.

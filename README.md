@@ -11,6 +11,7 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
+| **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt) | int4 g128 | **24.3 t/s** | **~700 t/s** (chunked) | **~0%** | ~0.8 GB |
 | **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 18.1 t/s | **~0%** | **1.1 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
@@ -138,6 +139,21 @@ attacked:
 - `GGML_AXCL_STREAM=1`: the 28 layer executes enqueue asynchronously on
   one stream (hidden ping-pong + per-layer caches have no cross-call
   hazards), synchronized once after layer 27: 18.9 → 19.6 t/s.
+
+### 4. Chunked prefill un-broken (2026-08-27)
+- The "broken" chunk ladder was a host binding bug, not an engine bug:
+  chunk-group K_cache_out is BYTE-EXACT vs per-token decode for m=8..128
+  (gemm/phase_c_refcheck.c) once every output is bound to its own
+  exact-size dedicated buffer, one IO handle per shape group, and no
+  offset binds. `axcl_layer_run_chunk` fixed accordingly: prefill
+  530 tokens 18.4 → **716.5 t/s**, greedy output byte-identical
+  (`GGML_AXCL_BATCH=1`). Caveat: m<64 groups never write `output` (y).
+- s4 engines (`llm_build2 -w s4` from a GPTQ-g128 checkpoint): 1166 µs/
+  layer at kv 2047 (vs 1500 w8a16) → **24.3 t/s** decode, coherent.
+- Measured perf model: ~25 GB/s marginal weight streaming (73% of the
+  34.1 GB/s LPDDR4x peak) + ~457 µs fixed per engine call; the chip's
+  transformer-GEMM ceiling is ~2.6 TOPS (gemm/gemmlab ladder) — decode
+  speed is bytes-per-token and tokens-per-pass, not TOPS.
 
 ### What didn't work (documented so you don't retry it)
 - **128-token prefill shape groups**: vendor engines carry a 10-group

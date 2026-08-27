@@ -86,6 +86,160 @@
 2. Per-layer exec time s4 vs s8 vs vendor w8a16 (w4 speed thesis).
 3. Marker-engine numerics vs numpy (ref_chain pattern).
 
+## Phase C EXECUTED (2026-08-27 morning session) — s4 THESIS CONFIRMED + CHUNK LADDER UNBROKEN
+
+Harnesses (new, on Pi as ~/phasec): `gemm/phase_c_timing.c` (generic group
+dump + timed execute), `gemm/phase_c_refcheck.c` (chunk-group K rows vs
+per-token decode-group K, same x/pos), `gemm/phase_c_onehot.c` (input-bind
+probe). Build: `gcc x.c -I/usr/include/axcl -L/usr/lib/axcl -laxcl_rt
+-laxcl_sys -Wl,-rpath,/usr/lib/axcl -lm`.
+
+### BINDING RULE (the un-breaker — cost 3 failed variants to find)
+axclrt executes correctly ONLY when: every input AND output tensor is bound
+(including V_cache_out), each to its own exact-size dedicated buffer, one IO
+handle per shape group, no offset/sub-buffer binds. Violations = silent exec
+failure or stale reads. This was the real cause of the earlier "chunk ladder
+broken" conclusion — not the engines.
+
+### Timing (sync execute, 200 iters, card idle)
+| engine | decode m=1 | chunk groups |
+|---|---|---|
+| s4 p64 kv255 (scratch/out_s4) | 772 µs | 64: 2148 µs, 64+px64: 3033 µs |
+| s8 p64 kv255 (scratch/out_s8) | 1070 µs | 64: 2169 µs, 3031 µs |
+| **s4 p64 kv2047 (rebuilt /tmp/int4lb2/out_s4_2048)** | **1166 µs** | same 2147/3032 |
+| vendor w8a16 kv2048 (control) | 1500 µs | 128-ladder 2808→5220 µs |
+| vendor post engine | 7917 µs — **1 group, m=1 only** | — |
+
+- Two-point fit (s4 vs s8, same shape): marginal weight streaming ≈ **25 GB/s**
+  (73% of the 34.1 GB/s LPDDR4x peak — DRAM is NOT the limiter) + **fixed
+  ≈ 457 µs/call** (sync execute incl. PCIe round-trip). The w8a16 path's
+  low effective GB/s was this fixed cost, not DRAM efficiency.
+- s4 kv2047 decode = 1166 µs = **1.29× vs vendor w8a16**; at bench ctx (~470)
+  ≈ 0.85 ms/layer → projected **~30 t/s decode** (vs 19.6) with unchanged
+  post engine + host.
+- s4 chunk64 == s8 chunk64 (m≥64 is compute-bound): prefill/verify passes do
+  NOT get faster with s4; only decode does.
+
+### Chunk groups were never broken
+- refcheck: chunk K_cache_out rows are **BYTE-EXACT** vs per-token decode
+  group K for m=8/16/32/64 (llm_build2) and m=128 (vendor) — input, indices,
+  rope all flow correctly through axclrt.
+- CAVEAT: the `output` (y) tensor is only written for **m ≥ 64** (m=8/16/32:
+  K/V_out correct, y untouched). Batched prefill + speculative verify must
+  use 64-token chunks until Axera fixes small-m y-write (bug-report fodder).
+- Verify-pass economics at m=64: 28 × 2.15 ms = 60 ms covers up to 64
+  candidates (one weight pass + one fixed cost). Multi-row logits need a
+  custom lm_head engine — vendor AND llm_build2 post are m=1-only (7.9 ms
+  per call at 152k vocab; ~19.6 GB/s, i.e. pure streaming).
+
+### Context-length tax (llama-simple, vendor w8a16, governor performance)
+- decode **19.64 t/s @ ctx≈60** vs **18.59 t/s @ ctx≈1580** → −5.6% only.
+  KV reads are not a dense full-cache sweep; long-context decode is fine.
+  (Vocab trim ≫ KV tricks at these lengths.)
+
+### Builds this session (x86, /tmp/int4lb2, marker ckpt unless noted)
+- mk_m8 (prefill 8), mk_p16, mk_p32, mk_base — group-probe engines.
+- out_s4_2048: FULL 28-layer s4 set, kv 2047 (layer files verified on card;
+  post was still building at session close) — deployment candidate for the
+  s4 path.
+- `--ld_param_opt` CRASHES llm_build2 7.0-patch1 (KeyError 'xxh128:..._ddr')
+  on the marker ckpt — retry on the real ckpt / newer toolchain before
+  writing it off.
+
+### Backend work order to bank the wins
+
+## Roadmap execution (2026-08-27 mid-day session) — items 1a + 2 BANKED
+
+
+### GEMM TOPS LADDER (measured 2026-08-27, K=1024 N=3072 static int8, 30 iters)
+m=128: 635.5us = 1.27 TOPS | m=256: 1019.5us = 1.58 | m=512: 1689us = 1.91
+m=1024: 2488.8us = 2.59 | m=2048: 5342.3us = 2.41
+=> transformer-shape ceiling ~2.6 TOPS (~11% of rated 24) on the w8a16
+   dataflow; per-row marginal ~2.5us/row + ~310us fixed. The 24 TOPS rating
+   is only reachable on pure-int8 conv paths (CV), not this toolchain's
+   LLM engines.
+
+### LOAD-BUG PATTERN CONFIRMED (2 engines, identical signature)
+`pulsar2 build` (ONNX-path) engines — vocab_m64 (165MB) AND post_trim
+(91MB) — fail to load INSIDE the backend process ("device 0 is not
+connected" -> zero-byte DMAs), while loading fine standalone and while
+same-size llm_build engines load in the same slot. After any such failure
+the card needs a wall power cycle. => Axera bug report #3. Workaround
+idea for next session: emit the verify head as an llm_build-style
+container, or load via axclrtEngineLoadFromMem.
+
+### kv1024 TG: UNMEASURED — engines redeployed to Pi /tmp/kv1024 (NOTE:
+/tmp does NOT survive Pi reboots; use ~ or /usr/local/share next time).
+
+### FINAL STATE 2026-08-27 (session close)
+**MEASURED ON CARD (post power-cycle, healthy):**
+- **s4-GPTQ (JunHowie/Qwen3-0.6B-GPTQ-Int4, g128) = 24.32 t/s TG, COHERENT**
+  ("Paris... Versailles..." — the raw-fp repetition loop is GONE).
+  Deployed: Pi ~/s4-gptq (29 files). Budget: 28×1.1665ms + 7.92 post + host.
+- Chunked prefill with binding fix: **716.5 t/s** (530-token prompt, was
+  18.4), greedy output byte-identical. GGML_AXCL_BATCH=1 safe.
+- vocab64 verify head (static int8 [64,1024]@[1024,151936]): loads solo,
+  **11.97ms/64 rows** (42× vs sequential post).
+
+**CARD STABILITY RULES (learned the hard way, 4 wedges today):**
+1. NEVER kill a process during engine loads (timeout wrappers around
+   llama-* = wedge roulette). Run detached (setsid) + poll.
+2. Engine load mid-graph corrupts the PCIe channel (vocab64 lazy-load).
+   All loads at init — fixed in backend.
+3. Recovery ladder: driver reload (modprobe -r/-v ax_pcie_host_dev stack)
+   works for EARLY wedges; deep wedges need a full POWER CYCLE (wall
+  unplug — Pi reboot does NOT reset the card). Symptom: "recv dma size 0
+   is not equal to N" + zero-byte channel sends.
+4. OPEN BUG: vocab64 (pulsar2-build product, 165MB) fails to LOAD inside
+   the backend process (fails first, solo, after reloads — while the
+   169MB llm_build post engine loads fine in the same slot). Root cause
+   unresolved; needs a healthy card to debug. Spec e2e blocked on it.
+
+**BUILT + DEPLOYED, UNTESTED (card wedged before bench):**
+- kv1024 s4 set: Pi /tmp/kv1024 (target ~28 t/s, KV read is dense-full-len).
+- GEMM TOPS ladder m=128..2048 (K1024×N3072 static int8): /tmp/int4lb2/
+  gemmlab — the chip's transformer-shape ceiling experiment.
+- Trimmed post (90.9k vocab) build: requeued (quota casualty) — check
+  posttrim/status2.txt; backend remap support ALREADY shipped+rebuilt
+  (GGML_AXCL_POST_TRIM env, auto-detects trimmed output size).
+
+**BACKEND CHANGES SHIPPED (llama.cpp fork, rebuilt on Pi):**
+- axcl_layer_run_chunk: per-group io_chunk[12], d_chunk_ko/vo staging +
+  post-exec D2D scatter (THE chunk fix).
+- vocab64 verify-head path (multi-row vocab matmul -> 64-row head call).
+- trim-remap post support.
+- recovery_bench.sh on Pi (~/phasec) runs the full queue.
+1. **s4 raw-fp deployed end-to-end: 23.76 t/s decode** (vendor-engine mode,
+   out_s4_2048 renamed p64→p128, GGML_AXCL_LAYER_DIR switch — zero backend
+   changes; ctx_len auto-derives from K_cache dims). Budget closes exactly:
+   28×1.1665ms + 7.92 post + ~1.5 host = 42.1ms. NOTE: the engine's KV read
+   is DENSE over the full cache length regardless of position (context-
+   independent 1166 µs) — a kv1024 build would run ~0.93 ms/layer → ~28 t/s
+   if long context isn't needed.
+   QUALITY: raw-fp s4 at g1024 GARBLES output (repetition loop) as the
+   community warned — must feed GPTQ-g128. JunHowie/Qwen3-0.6B-GPTQ-Int4
+   (gptqmodel 4.0.0, g128 sym) downloaded; s4 rebuild from it in flight.
+2. **Chunk-binding fix SHIPPED + verified** (ggml-axcl.cpp: per-group
+   io_chunk[12] handles, d_chunk_ko/vo staging + post-exec D2D scatter —
+   no offset output binds):
+   prefill 530 tokens: 18.43 t/s per-token → **716.5 t/s chunked = 38.9×**,
+   and the greedy continuation is BYTE-IDENTICAL to per-token prefill.
+   GGML_AXCL_BATCH=1 now safe to default-on (m=128 vendor ladder; the
+   llm_build2 64-ladder needs the chunk-size parameterized first).
+3. Vocab m=64 lm_head static-quant engine (X[64,1024]@W[1024,151936],
+   final norm stays host-side) building — the verify-logits primitive.
+1. s4: point GGML_AXCL_LAYER_DIR at out_s4_2048 (llm_build2 container, IO
+   names identical) → expect ~28-30 t/s; then the s4 claims-decode GGUF
+   patcher (R3 continuation).
+2. Re-enable GGML_AXCL_BATCH chunked prefill with the binding fix (dedicated
+   staging for the 64-row K/V_out + D2D scatter into cache rows; all outputs
+   bound; own IO handle per group) → prefill ~4×.
+3. Speculative decoding: n-gram draft on host (fork has speculative-simple/
+   lookup ngram-*), verification via the m=64 chunk group, custom m=64
+   lm_head (hostops vocab GEMM machinery) for all-position logits.
+4. Vocab-trimmed post engine (152k → 50-60k zh/en+specials, host-side id
+   remap): post 7.9 → ~2.7 ms → +11-15% decode, stacks with s4.
+
 ## Claims-decode series BUILT (2026-08-27 late) — state for next session
 - 9 marker builds through llm_build2 s4, ALL OK (2..7, d2, mc, mixamp).
   npu_params extracted to int4lab/scratch/claims/*_l0.npy.
