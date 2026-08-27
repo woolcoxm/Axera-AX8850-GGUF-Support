@@ -58,6 +58,37 @@ def make_V(matrix_name, build_idx):
     return V.astype(np.float32) / 127.0
 
 
+def make_V_d2(matrix_name):
+    """Dither probe: same codes as build 0, second dither family."""
+    shape = SHAPES[matrix_name]
+    n, kk = shape
+    rng = np.random.default_rng(SEEDS2[matrix_name])
+    dither = rng.integers(0, 13, shape)
+    rnb = int(np.ceil(np.log2(n)))
+    R, _ = np.meshgrid(np.arange(n), np.arange(kk), indexing='ij')
+    code = np.zeros(shape, np.int16)
+    for j in range(3):
+        code |= ((R >> j) & 1) << j
+    V = 16 * code + dither
+    V[:, 0] = 127
+    return V.astype(np.float32) / 127.0
+
+
+def make_V_mc(matrix_name):
+    """Matrix-code build: every element of matrix m carries code = m's index."""
+    shape = SHAPES[matrix_name]
+    rng = np.random.default_rng(SEEDS[matrix_name])
+    dither = rng.integers(0, 13, shape)
+    code = MATS.index(matrix_name)
+    V = 16 * code + dither
+    V[:, 0] = 127
+    return V.astype(np.float32) / 127.0
+
+
+MATS = list(SHAPES)
+SEEDS2 = {n: 151 + i for i, n in enumerate(SHAPES)}
+
+
 def save_safetensors(path, tensors):
     header, blobs, offset = {}, [], 0
     for name, arr in tensors.items():
@@ -76,7 +107,12 @@ def save_safetensors(path, tensors):
 
 def main():
     out = Path(sys.argv[1])
-    build_idx = int(sys.argv[2])
+    mode = sys.argv[2] if len(sys.argv) > 2 else '0'
+    amp = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+    build_idx = 0
+    if mode.isdigit():
+        build_idx = int(mode)
+        mode = 'code'
     out.mkdir(parents=True, exist_ok=True)
     import shutil
     for f in ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt']:
@@ -97,10 +133,19 @@ def main():
         tensors[p + 'post_attention_layernorm.weight'] = np.ones(HIDDEN, np.float32)
         tensors[p + 'self_attn.q_norm.weight'] = np.ones(HDIM, np.float32)
         tensors[p + 'self_attn.k_norm.weight'] = np.ones(HDIM, np.float32)
+        # mixamp mode: layer 1 weights halved -> l1 engine scales halve,
+        # codes/dither unchanged; diff of l1 engines isolates scale entries.
+        lamp = 0.5 if (mode == 'mixamp' and L == 1) else amp
         for mname, shape in SHAPES.items():
-            tensors[p + mname] = make_V(mname, build_idx)
+            if mode == 'd2':
+                t = make_V_d2(mname)
+            elif mode == 'mc':
+                t = make_V_mc(mname)
+            else:
+                t = make_V(mname, build_idx)
+            tensors[p + mname] = t * lamp if lamp != 1.0 else t
     save_safetensors(out / 'model.safetensors', tensors)
-    print(f'build {build_idx}: checkpoint at {out} ({len(tensors)} tensors, maxbits={MAXBITS})')
+    print(f'build {mode if mode != "code" else build_idx}: checkpoint at {out} ({len(tensors)} tensors, maxbits={MAXBITS})')
 
 
 if __name__ == '__main__':

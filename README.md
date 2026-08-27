@@ -11,10 +11,11 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
-| **Vendor-engine mode** (int8 w8a16 engines + full host pipeline) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
-| **Vendor-engine mode** (int8 w8a16 engines + full host pipeline) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
-| Dynamic-GGUF mode (flagship: GGUF weights, bf16 engines) | q8_0 | 10.2 t/s | 5.0 t/s | ~5% | 2.4 GB |
-| Dynamic-GGUF mode (flagship: GGUF weights, bf16 engines) | Q4_K_M | 10.1 t/s | 5.0 t/s | ~5% | 2.4 GB |
+| **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 17.5 t/s | **~0%** | **1.1 GB** |
+| Vendor-engine mode (int8 w8a16 engines, engines' own weights) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
+| Vendor-engine mode (int8 w8a16 engines, engines' own weights) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
+| Dynamic-GGUF mode (GGUF weights, bf16 engines) | q8_0 | 10.2 t/s | 5.0 t/s | ~5% | 2.4 GB |
+| Dynamic-GGUF mode (GGUF weights, bf16 engines) | Q4_K_M | 10.1 t/s | 5.0 t/s | ~5% | 2.4 GB |
 | Baked-weights mode (bf16 engines) | — | 10.1 t/s | 5.0 t/s | ~5% | 2.4 GB |
 | Legacy per-op mode (superseded) | — | 2.2 t/s | 1.6 t/s | ~100% | 5.5 GB |
 | Vendor closed runtime (their engine + their runner) | w8a16 | 13.5–14.5 t/s | — | — | — |
@@ -25,16 +26,16 @@ Vendor-engine mode quant column = the GGUF supplying tokenizer/graph/
 sampling; model compute is identical for both quants (engines carry their
 own weights), which the numbers confirm.
 
-**Headline: at 19.6 tokens/s with 2% host CPU, this open backend now
-outperforms the vendor's own closed-source runtime (13.5–14.5 t/s measured
-on the same card) — running llama.cpp, straight from GGUF, on a Raspberry
-Pi 5.**
+**Headline: at 19.5 tokens/s with the host CPU idle, GGUF weights run on
+the int8 NPU path — the fastest mode now carries the GGUF's own weights
+(beating the vendor's closed runtime at 13.5–14.5 t/s on the same card),
+with the best fidelity of any NPU mode (96% token agreement).**
 
 Fidelity (greedy prefix-token agreement vs the CPU reference of the same
-GGUF, 10 prompts × 24 tokens): vendor-engine mode q8_0 **94%** / Q4_K_M
-**90%**; dynamic-GGUF mode q8_0 **91%** / Q4_K_M **93%**. Divergence is
-near-tie tokens under different weight numerics (int8/bf16 engines vs the
-reference), not gross corruption.
+GGUF, 10 prompts × 24 tokens): **GGUF-int8 mode q8_0 96%**; vendor-engine
+mode q8_0 **94%** / Q4_K_M **90%**; dynamic-GGUF mode q8_0 **91%** /
+Q4_K_M **93%**. Divergence is near-tie tokens under different weight
+numerics, not gross corruption.
 
 ## Quick start
 
@@ -55,8 +56,18 @@ scp gemm/baked/real2048_bf16/qwen3_p128_l*_together.axmodel pi:/usr/local/share/
 scp gemm/baked/real2048_bf16/qwen3_post.axmodel       pi:/usr/local/share/ggml-axcl/layer/
 scp gemm/layout_v4.bin                                pi:/usr/local/share/ggml-axcl/layer/
 
-# fastest mode: vendor w8a16 engine set (int8 NPU path) — engines carry the
-# model weights; the GGUF supplies tokenizer/graph/sampling
+# fastest mode with GGUF weights: patch the int8 engines from the GGUF
+# (on the x86 box, ~2 min; one-time per GGUF):
+python3 gemm/gguf_patch_w8.py model-q8_0.gguf <vendor_engine_dir> out-dir
+scp out-dir/*.axmodel pi:~/gguf-i8/
+# on the Pi (post engine copied alongside):
+GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 \
+    GGML_AXCL_LAYER_DIR=$HOME/gguf-i8 \
+    GGML_AXCL_POST_MODEL=$HOME/gguf-i8/qwen3_post.axmodel \
+    ~/build-axcl/bin/llama-simple -m ~/models/qwen3-q8.gguf -n 48 "Your prompt"
+
+# vendor-engine mode (no patching; engines carry their own weights — the
+# GGUF supplies tokenizer/graph/sampling)
 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 \
     GGML_AXCL_LAYER_DIR=$HOME/Qwen3-0.6B \
     GGML_AXCL_POST_MODEL=$HOME/Qwen3-0.6B/qwen3_post.axmodel \
@@ -171,14 +182,32 @@ attacked:
    the on-card KV cache, FFN with SwiGLU). Per token: 28 engine calls +
    1 post-engine call (final norm + 151936-wide lm_head). Hidden state is
    bf16 and never leaves the card.
-2. **Weight patching**: the engine files store weights as **raw bf16 at
-   deterministic file offsets** (reverse-engineered; byte-exact validation:
-   patching layer-0's template with layer-1's weights reproduces the baked
-   layer-1 engine to 3 bytes — layer-index microcode — and computes
+2. **Weight patching (bf16 engines)**: the engine files store weights as
+   **raw bf16 at deterministic file offsets** (reverse-engineered; byte-exact
+   validation: patching layer-0's template with layer-1's weights reproduces
+   the baked layer-1 engine to 3 bytes — layer-index microcode — and computes
    identically on-card). The loader dequantizes each GGUF tensor row, bf16
    rounds it, and scatters it into a copy of the template via the sidecar
    table; patched files are cached by a hash of the weights.
-3. **Graph interception**: the backend claims the whole compute graph so
+3. **Weight patching (int8 w8a16 engines)**: the vendor engines' `npu_params`
+   blob is fully reverse-engineered. Weights are int8 per-row symmetric
+   (scale = rowmax/127, RTN + ~0.3 sparse activation-aware corrections per
+   row), stored as **two nibble planes**: a coarse byte per element pair
+   `(k, k+1)` holds the two top nibbles (`(q8>>4)+8`), and a fine byte 18
+   positions earlier holds the two low nibbles. The full layout — every
+   element's coarse/fine position for all 7 matrices of a layer, plus anchor
+   columns, scale-entry map (960 clusters, one 4-byte entry per row×kgroup),
+   and norm-entry map — was decoded from controlled Pulsar2 5.2 marker
+   builds (`gemm/decode_v52_*.py`) and validated on-card (patched-engine
+   A/B: layer output cosine 0.997). `gemm/gguf_patch_w8.py` dequantizes the
+   GGUF (Q8_0/Q4_K/Q6_K), requantizes against the engine's own scales, and
+   writes only elements that genuinely differ (≥2 int8 steps, mapping
+   verified against the reference checkpoint) — preserving the engine's
+   activation-aware corrections everywhere else. This keeps 96% token
+   agreement while carrying the GGUF's real weights at full int8 speed.
+   Note: the engine compute path is int8 regardless of source quant — the
+   GGUF's quantization only adds its own dequant error on top.
+4. **Graph interception**: the backend claims the whole compute graph so
    llama.cpp's scheduler delivers it unsplit; the first armed graph's
    prescan registers all weight tensors, patches + loads the engines
    (swap happens BEFORE any node executes), then each layer's q_proj
@@ -189,12 +218,20 @@ Full research log: `NOTES-DYNAMIC-WEIGHTS.md`.
 ## Test / eval / bench tooling
 
 - `gemm/e2e_test.sh` — the E2E matrix (run on the Pi) — **12/12 pass** on
-  both the dynamic-GGUF and vendor-engine modes (1→3000 token prompts,
-  unicode, emoji, shell metacharacters, empty prompts, SIGINT, 5×
-  back-to-back leak check)
+  the dynamic-GGUF, vendor-engine, and GGUF-int8 modes (1→3000 token
+  prompts, unicode, emoji, shell metacharacters, empty prompts, SIGINT,
+  5× back-to-back leak check)
 - `gemm/eval_suite.sh` — factuality/code/coherence scoring
 - `gemm/eval_agreement.sh` — token-agreement vs the CPU reference
 - `gemm/bench_suite.sh` — throughput, memory, stress, startup
+- `gemm/gguf_patch_w8.py` — GGUF → int8 engine patcher (the w8a16 loader
+  core; emits a `GGML_AXCL_LAYER_DIR` engine set)
+- `gemm/walk_axmodel.py` / `gemm/extract_npu_params.py` — axmodel protobuf
+  walk + npu_params extraction for any engine
+- `gemm/decode_v52_numpy.py`, `decode_v52_extra.py`, `decode_scale_entries.py`
+  — the w8a16 layout decoders (marker-build methodology)
+- `gemm/patch_vendor_w8.py` — identity/validation patcher (HF weights)
+- `gemm/engine_dump.c` — deterministic on-card engine A/B harness
 - `gemm/probe_groups.c` — shape-group dumper for any axmodel
 - `gemm/test_chunk.c` — chunk-group validation harness (reference vs single call)
 - `gemm/vendor_trace.c` — LD_PRELOAD tracer for vendor runtime IO conventions

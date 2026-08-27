@@ -292,3 +292,236 @@ run through the whole-layer engines. 12/12 E2E pass. q8_0 + Q4_K_M verified.
   Errno 122 on builds; disabled (kept as .research-disabled).
 - Killed runs can wedge the card (PCIe DMA errors on next load) — reboot
   the Pi to recover; governor resets to ondemand (set performance).
+
+## VENDOR w8a16 LAYOUT CRACK (2026-08-27) — npu_params structure SOLVED, marker decode underway
+
+Goal: patch GGUF weights into the vendor int8 engines (19.6 t/s path).
+
+### Container (gemm/walk_axmodel.py + gemm/extract_npu_params.py)
+- axmodel = protobuf. Top: f1 varint, f2 "Pulsar2", f6 version str,
+  f7 = big graph section. Inside f7: 10x f1 group IO descriptors,
+  f2 "ax-model", f5 = npu_params (f8 name + f9 data), then 10x f5
+  microcode segments (compressed -> per-layer file sizes vary).
+- Vendor 5.2 engines (Pulsar2 5.2, commit a3f2fda4): npu_params at file
+  offset 5035, length 19,226,120 B, IDENTICAL length in every layer.
+  Our 7.0 bf16 engines: npu_params at 1570.
+- Vendor build command (their README): llm_build --kv_cache_len 2048
+  --prefill_len 128 -c 1 --parallel 32 --last_kv_cache_len 128..1024
+  (8 rungs) -w s8, FLOAT_MATMUL_USE_CONV_EU=1. 10 shape groups.
+
+### npu_params region map (l0 vs l1 byte diff)
+- [0..8198] shared [i16 1267][bf16 .0884] repeating entries
+- [8199..12290] per-layer ~4KB, [12291..16392] shared
+- [16393..1297926] per-layer 1.28MB (R4; contains some q data)
+- [1297927..3395592] shared 2.1MB (rope-ish table)
+- [3395593..19199494] per-layer 15.8MB (R6; weights + meta, ~1:1 ratio)
+- [19199495..end] shared 26.6KB
+
+### Established storage facts
+- Weights = INT4 NIBBLE PAIRS: byte=(v_odd<<4)|v_even, v=q4+8 (bell
+  nibble histogram; exact anchors). R6 ~ 2x nibble mass -> ~1:1 meta.
+- Weights appear EXACTLY ONCE per nibble stream (anchor uniqueness
+  search) — but ~34% of ELEMENTS stored twice (21.16M nibble slots for
+  15.73M elements on the marker build) = decode+prefill group copies,
+  same ratio as the 7.0 s8 build.
+- Quant at anchored windows = norm-FOLDED per-row symmetric d7 RNE
+  (three distinctive anchors match exactly; folding confirmed: in_ln
+  gains mean 0.17, max 1.05).
+- BUT the vendor's integer values are NOT deterministic RTN of HF
+  weights: cross-layer validation fails (0/414 anchors reproduce in l1
+  at chance rate) -> their quant is calibration/activation-aware
+  (GPTQ-like). Embeddings match HF byte-exactly (sha256), same
+  checkpoint. Layout itself IS layer-independent (marker l0/l1 with
+  identical weights -> byte-identical npu_params).
+- Storage model (fits all evidence incl. 7.0's "36 meta bytes per 72B
+  unit... likely second weight representation"): the nibble plane is
+  the TOP nibble of an int8 quantization; the "meta" mass carries the
+  LOW nibble (-> w8 effective). 7.0 notes' "nibble = (q8>>4)+8
+  arithmetic shift" was the same phenomenon.
+
+### Marker-build path (the crack)
+- Pulsar2 5.2 LITE already local: pulsar2/5.2/5.2/ax_pulsar2_5.2_lite_package.
+  Marker ckpts via gemm/mk_code_marker.py (2-layer, 4k vocab; now with
+  d2 = dither-probe and mc = matrix-code modes).
+- Build cmd = vendor's exact flags but -c 0 (markers fail -c 1 check;
+  layout is check-independent). ~4.5 min/build.
+- Marker npu_params = 19,212,296 B (13,824 B shorter than vendor's —
+  scale-table section size differs; region map otherwise matches:
+  shared 2,097,336B table at ~1.29M, tail, etc.).
+- Decode: gemm/decode_v52_layout.py (nibble claims via code builds +
+  matrix codes; dither-invariance cm0 vs cmd2 validates code slots).
+  NEXT: run remaining builds (cmB2=bits 6-8 was MISSING from the first
+  batch — added later), decode, then re-anchor onto vendor engines
+  (handle the 13.8KB section shift), validate, then scale tables
+  (amplitude 1.0/0.5 builds) + loader.
+
+### Reusable scripts added this session
+- gemm/walk_axmodel.py (protobuf field-tree dumper)
+- gemm/extract_npu_params.py (npu_params extractor for any axmodel)
+- gemm/anchor_int8.py / anchor_nibble.py (scheme sweeps; superseded by
+  marker path but document the quant findings)
+- gemm/build_v52_markers.sh (serial marker builder)
+- gemm/decode_v52_numpy.py (claims decoder, memory-frugal numpy form)
+- Vendor engines l0/l1 + package docs: gemm/baked/vendor_w8a16/
+- All marker npu_params blobs + claims/fine tables: gemm/baked/v52_markers/
+  (gitignored, 220MB)
+
+## VENDOR w8a16 LAYOUT — DECODED (2026-08-27 late)
+
+Marker builds on Pulsar2 5.2 with the vendor's exact flags (10 code/dither/
+matrix/amplitude builds; cmB2 = bits 6-8 was needed beyond the first batch).
+Decoder: gemm/decode_v52_numpy.py -> v52_claims.npz + v52_fine.npz.
+
+### THE FORMAT (w8a16, Pulsar2 5.2, -w s8 llm_build path)
+- Effective weights are INT8, stored as TWO nibble planes:
+  * coarse byte at p: (v_{k+1} << 4) | v_k for the element pair
+    (even k, odd k+1) of the same (matrix, row); v = (q8 >> 4) + 8.
+  * fine byte at p - 18: (lo4(q8_{k+1}) << 4) | lo4(q8_k).
+    (lag -18 verified on 119,297/120,000 sampled pairs; 99.4% overall
+    assignment = unit = 18B fine | 18B coarse repeating.)
+  * q8 reconstruction: int8 = ((coarse_nib - 8) << 4) | fine_nib.
+- Claims coverage: ~100% of all 7 matrices' elements
+  (q 2,095,108/2,097,152 + recover k=0 anchor columns by elimination;
+  only (m,0,0) elements entangled with zero-fill garbage).
+- Intra-byte pairing: hi nibble = odd k, lo = even k (7.0 convention
+  confirmed; earlier 0-count was my check bug).
+- ~1.04M bytes of 0x88 zero-fill spread uniformly (decodes as all-zero
+  codes; skip). ~210K full-byte int8 positions (code hi + dither lo)
+  exist (like 7.0's "8-bit positions"); low priority (coverage complete
+  without them).
+- QUANT: codes are dither-INVARIANT (cm0 vs cmd2 builds) -> top nibbles
+  deterministic; vendor integer values are NOT RTN of HF weights
+  (activation-aware calibration in llm_build's yasched llama_test pass)
+  -> for GGUF patching WE choose the integers (RTN per-row int8 sym),
+  which is self-consistent; agreement vs their calibration is moot.
+- SCALE TABLE (mixamp amplitude diff): 960 clusters x 254B ~= 61,440
+  entries = per (row, kgroup-256). Entry = [u16 A][u16 B]: A drops by
+  EXACTLY 128 (1.0 in 24.7 fixed point) when all weights halve ->
+  A/128 = C - log2(scale)-like; B amplitude-INVARIANT (mantissa or
+  index). A varies within a cluster despite uniform groupmax ->
+  calibration-dependent. OPEN: exact formula + loader-side synthesis
+  (may need to replicate llm_build calibration stats, or find that B
+  encodes the per-group scale bf16 and A is a runtime-correctable).
+
+### NEXT STEPS (for the loader)
+1. Scale entry semantics: decode A,B across the 10 marker builds
+   (codes differ, scales same -> separates calibration-input effects).
+2. Transfer claims to vendor engines: marker npu_params is 13,824B
+   shorter; section map shifts piecewise (head +56, R4 end -8.8K,
+   rope end -9.2K, R6 end -13.9K). Align per-section (rope table is a
+   fixed anchor) or compare against a real-weights 5.2 build (use
+   --parallel 4..8, NOT 32 — the full-model build + analysis OOM'd the
+   30GB box once; keep python dicts out of analysis, numpy only).
+3. Round-trip: re-encode marker weights from claims+fine -> byte-exact
+   engine (validates the map end to end).
+4. Patch real GGUF weights into a vendor engine, on-card test on the
+   Pi (test_vendor_layer.c harness), then ggml-axcl loader integration.
+
+### Machine etiquette (learned the hard way)
+- python dict-of-15M-tuples ~= 10GB RSS; the claims now live as numpy
+  structured arrays (~300MB). /usr/bin/time -v everything big.
+- --parallel 32 full-model builds + analysis = OOM. Markers OK (tiny).
+
+## VENDOR w8a16 — FULLY CRACKED + ON-CARD VALIDATED (2026-08-27 night)
+
+### Everything confirmed in this session
+1. OUR 5.2 rebuild of HF Qwen3-0.6B with the vendor's flags is
+   BYTE-IDENTICAL to the vendor engines (0/19,226,120 bytes differ).
+   The engines are fully reproducible from the open checkpoint; quant is
+   deterministic. (gemm/baked/v52_real/ = our build.)
+2. QUANT FORMAT (final): weights UNFOLDED (norms run at runtime — unlike
+   7.0 builds!), per-ROW symmetric scale = rowmax/127, int8 RTN + ~0.3
+   sparse Hessian-ish corrections per row (4,030/15.7M elements differ
+   from RTN). Decoded-engine-int8 vs RTN agreement 99.97%.
+3. Claims->vendor map EXACT (from claim-order monotonicity): R4 +8192;
+   R6: +9216 / +9728 (after marker 4,523,255; a +512 insertion) /
+   +13824 (after marker 8,936,951; a +4096 insertion).
+4. SCALE-ENTRY TABLE (exact map): real-vs-realmix diff = 960 clusters,
+   53,258 bytes ~= 13.3K 4-byte entries ~= per-row. Entry [u16 A][u16 B]:
+   A shifts EXACTLY -128 (24.7 fixed = log2 step) when weights halve; B
+   weight-dependent. NORM-ENTRY TABLE (real-vs-realmorm diff): 3,139
+   bytes, zero overlap with scales. Both must be patched for arbitrary
+   GGUFs (currently left untouched = identity-patch-consistent).
+5. WRITE-PATH GUARDS (each found via single-byte on-card bisection):
+   - scale entries (136KB mask, +/-16B dilated)
+   - 0x00 inactive slots (writing one detonates the engine: e25 y)
+   - insertion-edge bytes (+/-2KB windows at the two insertions)
+   - read-verification: keep only claims whose stored nibble matches
+     RTN(reference) within +-1 (subsumes the above; 99.998% pass)
+   - fine-plane writes only at dither-verified per-pair positions
+6. ON-CARD A/B (engine_dump.c, seeded inputs, deterministic):
+   identity-patched l0 engine vs original: K/V_out meanabs 1.8-5.4%
+   of signal, layer output y cosine 0.9969, diff spread broadly (no
+   structural corruption). CONTROLS: 100 one-step nibble perturbations
+   in v -> y exactly unchanged (attention-neutral mask); in gate/up/
+   down -> y ~0.003% (noise floor reference).
+7. Test-harness lessons: all-ones KV/mask input makes attention scores
+   exactly tied -> softmax amplifies +-1 weight noise to e25 (chaos
+   artifact, not corruption — wasted hours on it). Use seeded generic
+   inputs + controls before believing an A/B diff. K_cache_out is a
+   single 2KB row (not the full cache). Mask self-slot is 2048.
+
+### Files (loader core + validation)
+- gemm/patch_vendor_w8.py — the patcher (identity mode; GGUF-mode TODO:
+  patch scale+norm entries, quantize arbitrary weights)
+- gemm/engine_dump.c — deterministic engine A/B harness (Pi)
+- baked/v52_markers/: claims/anchors/fine tables, real_l1/realmix_l1/
+  realmorm_l1 npu_params (scale/norm masks), vendor blobs
+- baked/v52_real/ — our byte-exact vendor-equivalent engine set
+
+### NEXT for GGUF patching (production)
+1. Scale-entry WRITE format: decode A/B semantics fully (A = C -
+   128*log2(scale)?), patch per-row scales for arbitrary weights.
+   Norm entries likewise (from GGUF norms).
+2. Extend patcher: GGUF dequant -> per-row int8 (vs engine's own scales
+   read back from A-entries, or freshly written).
+3. ggml-axcl.cpp loader integration (template engines + sidecar +
+   runtime patch, cache by weight hash — mirror of the bf16 path).
+4. Rebuild marker set is NOT needed for other layers (layout is
+   layer-independent; only scale/norm VALUES differ).
+
+## GGUF-INT8 MODE SHIPPED (2026-08-27 late night) — 19.5 t/s, 96% agreement
+
+`gemm/gguf_patch_w8.py`: full pipeline working end-to-end.
+
+### The final recipe
+- Dequant GGUF (Q8_0/Q4_K/Q6_K — validated vs ggml reference dequant,
+  corr 0.9999/0.997) -> per-row symmetric int8 against the ENGINE'S OWN
+  scales (= rowmax(HF-reference)/127; the engines are byte-identical to a
+  5.2 rebuild of the HF checkpoint, so the reference rowmaxes ARE the
+  engine scales).
+- DUAL write filter: write an element only if (a) its mapping is verified
+  — RTN(HF-ref) matches the stored int8 within +-1 — AND (b) the GGUF's
+  value genuinely differs — |RTN(GGUF) - stored| >= 2. (a) drops
+  mis-mapped claims/structural bytes; (b) preserves the engine's sparse
+  activation-aware (GPTQ-like) corrections everywhere the GGUF agrees
+  with the checkpoint, which is what makes the mode MORE faithful than
+  vendor-engine mode (96% vs 94%).
+- All structural guards from the earlier session stay (scale-entry mask,
+  0x00 inactive slots, insertion windows on coarse AND fine targets).
+
+### Results (Pi, governor performance)
+- decode 19.4-19.5 t/s, prefill 17.5 t/s, CMM 1.1GB, host CPU idle
+- E2E 12/12 PASS (5 after a stale-process retry — see below)
+- agreement vs CPU reference: 153/159 prefix tokens = 96%, 4/10 exact
+
+### Hard-won gotchas this session (all cost hours — read before touching)
+1. THE POST ENGINE. `rm ~/dir/*.axmodel` before re-deploying layer
+   engines also deletes qwen3_post.axmodel; if GGML_AXCL_POST_MODEL then
+   points at nothing, the backend silently falls back to the legacy
+   per-op path: 0.4 t/s AND garbage output (the legacy FA/output path is
+   known-wrong). Symptom signature: "slow + garbage" = missing post,
+   "fast + garbage" = weight problem. Always re-check the post file.
+2. An LS-fit scale (vs the engine int8s) is systematically ~0.2% low; the
+   engine dequantizes with ITS stored scale, so the bias multiplies every
+   weight the same direction and compounds over 28 layers -> fluent but
+   wrong generation. Always quantize against rowmax(HF)/127 exactly.
+3. Overwriting the engine's ~4K/layer activation-aware corrections with
+   plain RTN (write-everything strategy) degrades output measurably.
+   Writing ONLY >=2-step diffs while dropping mis-mapped claims (the dual
+   filter) is both the most faithful and the safest.
+4. A stale llama-simple holding the card makes the next run's engines
+   fail to load mid-suite (rc=1 decode failures). Check axcl-smi /
+   pgrep before running suites; re-run failures once the card is free.
+5. axcl-smi lives at /usr/bin/axcl/axcl-smi (not on PATH) on this Pi
+   image. CMM baseline 18 MiB.
