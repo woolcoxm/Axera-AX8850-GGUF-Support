@@ -151,6 +151,25 @@ broken" conclusion — not the engines.
 ## Roadmap execution (2026-08-27 mid-day session) — items 1a + 2 BANKED
 
 
+
+### DRIVER UPGRADE + FINAL NUMBERS (2026-08-27 evening)
+- axcl V3.10.2 installed on the Pi (deb at ~/axcl_host_aarch64_V3.10.2*.deb;
+  NOTE: new package ships UNVERSIONED libs — needed `for f in libaxcl_*.so;
+  ln -s $f ${f%.so}.so.1` in /usr/lib/axcl + ldconfig for every built binary).
+- Card firmware now V3.10.2. MEASURED ON IT:
+  * s4-GPTQ @ kv2047: **24.55 t/s** (stable vs 24.32 on old driver)
+  * **s4-GPTQ @ kv1023 (/tmp/kv1024): 29.90 t/s, coherent** — new record
+    (+52% over shipped w8a16). 1k-ctx cap; redeploy after every reboot.
+- The in-backend pulsar2-build load bug PARTIALLY persists: vocab64 loads
+  standalone AND after other engines in multi_load on V3.10.2, but the
+  trimmed post still fails inside llama-simple init (0.21 t/s cascade,
+  spec run aborted). => the residual bug is in the BACKEND's init context
+  (pinned-host allocations? second context?), not the driver. Next moves:
+  axclrtEngineLoadFromMem, or trim the vocab64 head to ~55k (3x smaller
+  transfer) per PERF-PLAN Phase 5.
+- axcl-smi on V3.10.2 gains EP-panic card reset (untested — try it before
+  driver reloads next wedge).
+
 ### GEMM TOPS LADDER (measured 2026-08-27, K=1024 N=3072 static int8, 30 iters)
 m=128: 635.5us = 1.27 TOPS | m=256: 1019.5us = 1.58 | m=512: 1689us = 1.91
 m=1024: 2488.8us = 2.59 | m=2048: 5342.3us = 2.41
