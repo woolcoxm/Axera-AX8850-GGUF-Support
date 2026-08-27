@@ -1,6 +1,6 @@
 # LLM-8850 on Raspberry Pi 5: llama.cpp now runs GGUF models at 19.6 tok/s — faster than the bundled runtime
 
-*Update to my LLM-8850 project thread. Open source: github.com/woolcoxm/llama.cpp (branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8`) + the research repo: github.com/woolcoxm/LLMTest.*
+*Update to my LLM-8850 project thread. Open source: github.com/woolcoxm/llama.cpp (branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8`) + the research repo: github.com/woolcoxm/Axera-AX8850-GGUF-Support.*
 
 Quick summary for fellow LLM-8850 owners: I've been building a custom llama.cpp backend (`ggml-axcl`) that drives the card's AX8850 NPU directly — Qwen3-0.6B runs **straight from a GGUF file** (q8_0 and Q4_K_M both work, no model conversion), with every transformer layer compiled as a single NPU graph and the KV cache living on the card.
 

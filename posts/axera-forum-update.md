@@ -1,6 +1,6 @@
 # llama.cpp backend for AX8850 (M5Stack LLM-8850 on Raspberry Pi 5): 19.6 tokens/s — faster than the vendor runtime
 
-*Update to my earlier thread on the custom ggml-axcl backend. Repo: github.com/woolcoxm/llama.cpp (branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8`) + research lab: github.com/woolcoxm/LLMTest.*
+*Update to my earlier thread on the custom ggml-axcl backend. Repo: github.com/woolcoxm/llama.cpp (branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8`) + research lab: github.com/woolcoxm/Axera-AX8850-GGUF-Support.*
 
 ## Where it stands
 
