@@ -179,6 +179,42 @@ attacked:
   NPU (which we use). Same for pulsar2 `--npu_mode` — and `-c` is
   check_level, not cores.
 
+## Software / firmware stack (verified)
+
+| Layer | Version | Notes |
+|---|---|---|
+| Host | Raspberry Pi 5, kernel 6.12.96+rpt-rpi-2712 | CPU governor `performance` for benchmarking |
+| Card | M5Stack LLM-8850 (Axera AX8850, 24 TOPS int8, 8 GB LPDDR4x) | M.2 via PCIe |
+| Host driver (axclhost) | **3.6.5-m5stack1** | M5Stack build; backup kept in `driver-good/` in this repo |
+| Card firmware | M5Stack `ax650_card.pac` (identifies as AX650N V3.6.4 on this host) | matched pair with the host driver — do not mix |
+| llama.cpp fork | branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8` | backend: `ggml/src/ggml-axcl/ggml-axcl.cpp` |
+| Engine toolchain (s4/int4 builds) | Pulsar2 7.0-patch1 (`llm_build2 -w s4`) | in `pulsar2/` |
+| Engine toolchain (w8a16 crack basis) | Pulsar2 5.2 (marker builds) | vendor engines are byte-reproducible with it |
+| s4 source checkpoint | `JunHowie/Qwen3-0.6B-GPTQ-Int4` (gptqmodel 4.0.0, g128 sym) | raw-fp input garbles; GPTQ-g128 required |
+
+### Version sensitivity (measured the hard way)
+
+| Capability | axclhost 3.6.5-P1 (Pi image) | 3.6.5-m5stack1 (this repo's backup) | V3.10.2 (generic Axera) |
+|---|---|---|---|
+| Whole-layer decode (all modes) | ✓ | ✓ (~23 t/s s4) | ✓ |
+| Batched prefill (chunk groups) | ✓ 716 t/s | **✗ runtime refuses chunk-group executes** | ✓ |
+| `pulsar2 build` engines after llm_build engines | ✗ (drops PCIe device) | ✗ | ✓ |
+| Card firmware pairing | M5Stack fw only | M5Stack fw only | generic fw (M5 fw + this host = unstable) |
+
+The 24.5/26.8/29.9 t/s rows above were measured on the V3.10.2 stack; the
+M5Stack-stack-verified figures are the headline ones. M5Stack firmware
+flashing (`/lib/firmware/axcl/ax650_card.pac`, applied at boot when the
+version differs) must never be cycled repeatedly — four flashes in one
+evening left the card executing nothing until a matched-pair reinstall
+plus full reflash recovered it.
+
+### Card stability rules
+1. Never kill a process during engine loads — it can wedge the PCIe channel.
+2. Early-wedge recovery: reload the driver module stack (`modprobe -r` /
+   `modprobe` for `ax_pcie_host_dev`, `axcl_host` + deps).
+3. Deep wedge: full wall-power cycle — a Pi reboot does not reset the card.
+4. After any Pi reboot: re-set the CPU governor to `performance`.
+
 ## Modes
 
 | Env | What it does |
