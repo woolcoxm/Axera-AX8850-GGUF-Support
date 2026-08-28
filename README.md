@@ -13,6 +13,7 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
+| **Qwen3.5-0.8B hybrid** (vendor w4a16 engine set, 18 delta-net + 6 attn layers) | any GGUF | **27.0 t/s** @ short ctx, 25.2 @ 2k | per-token (~5 t/s) | **~0%** | **0.9 GB** |
 | s4 kv1024 (1k ctx cap) *(axcl V3.10.2 stack)* | int4 g128 | 29.9 t/s | ~700 t/s (chunked) | **~0%** | ~0.6 GB |
 | s4 + trimmed post (90.9k vocab) *(axcl V3.10.2 stack)* | int4 g128 | 26.8 t/s | ~700 t/s (chunked) | **~0%** | ~0.8 GB |
 | **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **1,276 t/s** (chunked) | **~0%** | ~0.8 GB |
@@ -92,7 +93,19 @@ GGML_AXCL_GGUF=1 GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 \
 
 Notes:
 - llama-simple takes the prompt as a **positional argument** (not `-p`), and
-  `-n` must come *before* the prompt.
+  `-n` must come *before* the prompt. It parses only `-m`/`-n`/`-ngl` — other
+  flags like `-c` fall into the prompt text.
+- **Qwen3.5-0.8B** (hybrid architecture): drop the
+  [AXERA-TECH Qwen3.5-0.8B-AX650-GPTQ-Int4](https://huggingface.co/AXERA-TECH/Qwen3.5-0.8B-AX650-GPTQ-Int4-C128-P1152-CTX2047)
+  engine dir in as `GGML_AXCL_LAYER_DIR` and any Qwen3.5-0.8B GGUF — no
+  other env changes. The set is autodetected (24 layers: 18 gated-delta-net
+  + 6 full-attention), per-layer IO geometry comes from the runtime API, and
+  the delta-net layers' conv/SSM state lives on-card (ping-pong state
+  buffers, 1.0 gate masks). Measured: 27.0 t/s decode short-ctx / 25.2 t/s
+  near 2k ctx, 894 MiB CMM — fits the 4 GB card with room to spare. The
+  GGUF supplies tokenizer/graph/sampling; the engines carry the weights
+  (both Q4_K_M and Q8_0 GGUFs verified). Chunked prefill off for this arch
+  until the hybrid ladder semantics are validated.
 - First run per GGUF patches 28 engines (~30s, cached afterwards in
   `/tmp/axcl-gguf`, keyed by a hash of the weights). Warm starts take ~60s
   to load 28×65MB engines into card memory.
