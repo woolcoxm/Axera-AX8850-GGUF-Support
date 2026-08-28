@@ -13,7 +13,7 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
-| **Qwen3.5-0.8B hybrid** (vendor w4a16 engine set, 18 delta-net + 6 attn layers) | any GGUF | **27.0 t/s** @ short ctx, 25.2 @ 2k | per-token (~5 t/s) | **~0%** | **0.9 GB** |
+| **Qwen3.5-0.8B hybrid** (18 delta-net + 6 attn layers, chunk ladder) | any GGUF | **27.0 t/s** flat @2k ctx | **121–201 t/s** (ladder) | **~0%** | **0.9 GB** |
 | s4 kv1024 (1k ctx cap) *(axcl V3.10.2 stack)* | int4 g128 | 29.9 t/s | ~700 t/s (chunked) | **~0%** | ~0.6 GB |
 | s4 + trimmed post (90.9k vocab) *(axcl V3.10.2 stack)* | int4 g128 | 26.8 t/s | ~700 t/s (chunked) | **~0%** | ~0.8 GB |
 | **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **1,276 t/s** (chunked) | **~0%** | ~0.8 GB |
@@ -97,15 +97,58 @@ Notes:
   flags like `-c` fall into the prompt text.
 - **Qwen3.5-0.8B** (hybrid architecture): drop the
   [AXERA-TECH Qwen3.5-0.8B-AX650-GPTQ-Int4](https://huggingface.co/AXERA-TECH/Qwen3.5-0.8B-AX650-GPTQ-Int4-C128-P1152-CTX2047)
-  engine dir in as `GGML_AXCL_LAYER_DIR` and any Qwen3.5-0.8B GGUF — no
-  other env changes. The set is autodetected (24 layers: 18 gated-delta-net
-  + 6 full-attention), per-layer IO geometry comes from the runtime API, and
-  the delta-net layers' conv/SSM state lives on-card (ping-pong state
-  buffers, 1.0 gate masks). Measured: 27.0 t/s decode short-ctx / 25.2 t/s
-  near 2k ctx, 894 MiB CMM — fits the 4 GB card with room to spare. The
-  GGUF supplies tokenizer/graph/sampling; the engines carry the weights
-  (both Q4_K_M and Q8_0 GGUFs verified). Chunked prefill off for this arch
-  until the hybrid ladder semantics are validated.
+  engine dir in as `GGML_AXCL_LAYER_DIR` and any Qwen3.5-0.8B GGUF. The set
+  is autodetected (24 layers: 18 gated-delta-net + 6 full-attention);
+  per-layer IO geometry comes from the runtime API; the delta-net layers'
+  conv/SSM state lives on-card (ping-pong double-buffered, 1.0 gate masks,
+  0/−65536 attention masks — all vendor-runtime conventions). Any quant
+  works: the engines carry the weights, the GGUF supplies
+  tokenizer/graph/sampling (Q4_K_M and Q8_0 verified identical).
+
+  **Measured (Pi 5 + LLM-8850 8GB, greedy, regression-suite runs
+  2026-08-28):**
+
+  | | decode @300 ctx | decode @2k ctx | prefill (11-group ladder) | peak CMM |
+  |---|---|---|---|---|
+  | Q4_K_M GGUF | 27.00 t/s | 27.05 t/s | 121 t/s @608 tok, 201 @1147 | 895 MiB |
+  | Q8_0 GGUF | 26.95 t/s | 26.98 t/s | 119 t/s @608 tok | 895 MiB |
+
+  Decode is **flat with context** (27 t/s at 300 and at 2000 tokens): 18 of
+  24 layers are linear-attention with fixed state — no KV growth. 895 MiB
+  card memory leaves ~2.6 GB headroom on the 4 GB kit; decode is
+  bandwidth-bound, so both RAM SKUs generate at the same speed. The chunk
+  ladder (groups 1..10, 128 tokens each) folds whole chunks into the
+  recurrent state in one engine call — greedy output is **byte-identical**
+  to per-token prefill on short prompts (1.000 prefix agreement) and
+  agrees through 1465+ chars on multi-chunk prompts (bf16 batch-vs-
+  sequential near-ties only). Deep-prompt (1147-token) runs verified
+  crash-free (this shape segfaulted before the KV-flush value-snapshot
+  fix). Quality eval (`gemm/q35_eval.sh`, 12 cases): 7/12 Q4_K_M, 6/12
+  Q8_0 — strong on direct facts (capitals, primes, 12÷3, entity tracking,
+  translation), misses on some world knowledge (planet order, Moby-Dick
+  author, 17+25) — consistent with a 0.8B reasoning model under greedy
+  decoding; scores are quant-invariant (same engine weights).
+
+  **Vision (Qwen3.5 is multimodal):** image encoding verified via the
+  standard llama.cpp mmproj path on the Pi's CPU
+  (`llama-mtmd-cli --mmproj mmproj-BF16.gguf --no-mmproj-offload`, ~54 s
+  per image at BF16). Routing the image-embedding ubatches through the
+  NPU text stack is implemented (embedding-batch staging + M-RoPE
+  triple-indices for the engines' [3,128] chunk-indices input) but
+  currently crashes inside the axcl driver's allocator (`libaxcl_pkg`) —
+  tracked as the known issue below. The vendor's compiled
+  `qwen3_5_vision.axmodel` (108 MB, 384×384) is staged for a future NPU
+  vision-tower path.
+
+  **MTP (multi-token prediction):** Qwen3.5 ships a trained NextN/MTP head
+  and this llama.cpp fork supports `--spec-type draft-mtp`. NOT enabled on
+  the NPU path yet: the vendor engine set has only m=1 (decode) and m=128
+  (chunk) shapes, and verification scales with m — MTP loses money without
+  a small-batch verification engine set. The enabler is identified:
+  `pulsar2 llm_build --prefill_len 4` can build an m=4 verification set,
+  plus one MTP-block draft engine and a multi-row head (the 0.6B vocab64
+  engine is precedent). MTP-capable GGUFs verified staged
+  (`prithivMLmods/Qwen3.5-0.8B-MTP-GGUF`, blk.24 head present).
 - First run per GGUF patches 28 engines (~30s, cached afterwards in
   `/tmp/axcl-gguf`, keyed by a hash of the weights). Warm starts take ~60s
   to load 28×65MB engines into card memory.
@@ -312,6 +355,31 @@ Full research log: `NOTES-DYNAMIC-WEIGHTS.md`.
 - `gemm/test_chunk.c` — chunk-group validation harness (reference vs single call)
 - `gemm/vendor_trace.c` — LD_PRELOAD tracer for vendor runtime IO conventions
 - `gemm/chain_test.c` + `gemm/ref_chain.py` — engine-chain vs numpy reference
+
+## Known issues (2026-08-28 card incident)
+
+After a session with several abnormal process deaths (a segfault since
+fixed, SIGKILL timeouts), the card entered a state where the **0.6B s4
+chunk-ladder mode** faults the runtime memory service (`memory memcpy nil
+pointer`) or computes garbage — on every code variant tested, including the
+historically-verified one, while per-token s4, the vendor 0.6B set, and the
+entire Qwen3.5 stack (incl. its own chunk ladder) run correctly. Treat it as
+card-state damage, not code: the regression suite gates the s4 chunk cases
+behind `S4_CHUNK=1` until the card is firmware-recovered. The same incident
+taught the stability rules below (SIGINT-first teardown, execute-canaries).
+
+## Regression suite
+
+`gemm/regression_suite.sh` (run on the Pi) is the gate for any backend
+change. It covers every mode above plus: execute-canaries per engine
+family, a recovery ladder (zombie sweep → ordered driver reload → counted
+self-reboot with cron-@reboot resume → wall-power instruction), clean-state
+full reruns after mid-suite recovery, golden-output drift detection,
+throughput floors, greedy ladder-vs-per-token agreement, deep-prompt crash
+coverage, unicode, and a CMM leak check. Verdicts distinguish FAIL (code)
+from TAINT (card corruption signatures). Benchmarks: `gemm/q35_bench.sh`
+(per-quant t/s + peak CMM); evals: `gemm/q35_eval.sh` (12-case quality
+suite).
 
 ## Troubleshooting
 

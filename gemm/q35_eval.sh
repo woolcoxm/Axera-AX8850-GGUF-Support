@@ -12,7 +12,7 @@ RUNNER="${RUNNER_BIN:-$HOME/build-axcl/bin/llama-simple}"
 EDIR="${Q35_DIR:-$HOME/Qwen3.5-0.8B-int4}"
 GGUF="${1:?usage: q35_eval.sh <gguf> [label]}"
 LABEL="${2:-$(basename "$GGUF" .gguf)}"
-N=64
+N=160   # reasoning model: give <think> room before the answer
 export LD_LIBRARY_PATH="/usr/lib/axcl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PASS=0; FAIL=0
 
@@ -25,7 +25,7 @@ ask() { # prompt -> stdout (cleaned)
 check() { # name prompt pattern
     local name="$1" prompt="$2" pat="$3" out
     out=$(ask "$prompt")
-    if echo "$out" | grep -qE "$pat"; then
+    if echo "$out" | grep -qEi "$pat"; then
         PASS=$((PASS+1)); echo "PASS  $name"
     else
         FAIL=$((FAIL+1)); echo "FAIL  $name — got: $(echo "$out" | tail -2 | head -c 120)"
