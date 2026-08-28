@@ -153,6 +153,22 @@ broken" conclusion — not the engines.
 
 
 
+
+### SESSION CLOSE (2026-08-28 ~03:00) — EVERYTHING WORKING, ROOT CAUSES CLOSED
+1. **Batch-prefill "refusal" was OUR bug, not the driver's**: the chunk
+   ladder's depth is build-dependent (vendor 10 groups = 1152-token
+   coverage; llm_build2 s4 sets = 3 groups = 256-token coverage). The
+   dispatch assumed a bottomless ladder -> prompts >256 tokens aborted
+   ("chunk ladder failed at layer 0 chunk 2"). Fix (fork 9db8049):
+   capacity from n_groups + per-token fallback beyond it + graceful
+   mid-ladder degradation. VERIFIED: 314-token prompt, 0 errors,
+   **1276 t/s prefill** + 22.6 t/s decode on the M5Stack stack.
+2. Final working stack: axclhost 3.6.5-m5stack1 (driver-good/ deb) +
+   M5 3.6.6-deb card pac. Fan quiet. Decode ~23 t/s (s4), all modes OK.
+3. The image ships NO driver (apt-installed post-boot) — the "P1" build
+   IS the repo's 3.6.5-m5stack1. Card-firmware archaeology: three pac
+   variants (3.6.5-deb 9f21f721, 3.6.6-deb 75712ac6, generic d636314).
+
 ### BACKEND-INIT DEBUG COMPLETE (2026-08-28 early)
 1. VENDOR BUG (V3.10.2, clean repro): loading a `pulsar2 build` engine
    AFTER any llm_build engine drops the PCIe device ("recv dma size 0").

@@ -15,7 +15,7 @@ same code path.
 |---|---|---|---|---|---|
 | s4 kv1024 (1k ctx cap) *(axcl V3.10.2 stack)* | int4 g128 | 29.9 t/s | ~700 t/s (chunked) | **~0%** | ~0.6 GB |
 | s4 + trimmed post (90.9k vocab) *(axcl V3.10.2 stack)* | int4 g128 | 26.8 t/s | ~700 t/s (chunked) | **~0%** | ~0.8 GB |
-| **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **~700 t/s** (chunked) | **~0%** | ~0.8 GB |
+| **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **1,276 t/s** (chunked) | **~0%** | ~0.8 GB |
 | **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 18.1 t/s | **~0%** | **1.1 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
@@ -32,7 +32,7 @@ sampling; model compute is identical for both quants (engines carry their
 own weights), which the numbers confirm.
 
 **Headline: ~23 t/s decode on int4 s4 engines (24.5 measured on the
-axcl V3.10.2 stack) with the Pi's CPU idle; the GGUF-int8 mode below
+axcl V3.10.2 stack) and 1,276 t/s prompt processing, with the Pi's CPU idle; the GGUF-int8 mode below
 additionally patches the GGUF's own weights into int8 engines (96%
 token agreement) — beating the vendor's closed runtime (13.5–14.5 t/s
 on the same card) in every mode. Verified stack: the M5Stack axclhost
@@ -185,7 +185,7 @@ attacked:
 |---|---|---|
 | Host | Raspberry Pi 5, kernel 6.12.96+rpt-rpi-2712 | CPU governor `performance` for benchmarking |
 | Card | M5Stack LLM-8850 (Axera AX8850, 24 TOPS int8, 8 GB LPDDR4x) | M.2 via PCIe |
-| Host driver (axclhost) | **3.6.5-m5stack1** | M5Stack build; backup kept in `driver-good/` in this repo |
+| Host driver (axclhost) | **3.6.5-m5stack1** | M5Stack build; backup kept locally in `driver-good/` (gitignored — re-download from the M5Stack apt pool if needed) |
 | Card firmware | M5Stack `ax650_card.pac` (identifies as AX650N V3.6.4 on this host) | matched pair with the host driver — do not mix |
 | llama.cpp fork | branch `Axera-8850-GGUF-support-PoC-qwen3-0.9b-Q4KM-Q8` | backend: `ggml/src/ggml-axcl/ggml-axcl.cpp` |
 | Engine toolchain (s4/int4 builds) | Pulsar2 7.0-patch1 (`llm_build2 -w s4`) | in `pulsar2/` |
@@ -197,7 +197,7 @@ attacked:
 | Capability | axclhost 3.6.5-P1 (Pi image) | 3.6.5-m5stack1 (this repo's backup) | V3.10.2 (generic Axera) |
 |---|---|---|---|
 | Whole-layer decode (all modes) | ✓ | ✓ (~23 t/s s4) | ✓ |
-| Batched prefill (chunk groups) | ✓ 716 t/s | **✗ runtime refuses chunk-group executes** | ✓ |
+| Batched prefill (chunk groups) | ✓ 716 t/s (vendor set) | ✓ 1,276 t/s (s4 set; needs fork `9db8049` — the ladder-depth fix) | ✓ |
 | `pulsar2 build` engines after llm_build engines | ✗ (drops PCIe device) | ✗ | ✓ |
 | Card firmware pairing | M5Stack fw only | M5Stack fw only | generic fw (M5 fw + this host = unstable) |
 
