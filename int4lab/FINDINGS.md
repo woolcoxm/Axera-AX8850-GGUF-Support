@@ -154,6 +154,25 @@ broken" conclusion — not the engines.
 
 
 
+
+### QWEN3-1.7B s4 + 10K CONTEXT (2026-08-28 night) — HA-REBUTTAL CONFIG, MEASURED
+- Build: llm_build2 -w s4, JunHowie Gwen3-1.7B-GPTQ-Int4 (g128),
+  --max_context 10240 --decode_step_size 1024 --parallel 2 (rc=0).
+  LESSON: parallel>=4 on this 1.7B silently died post-"prepare" (and
+  parallel 8 + tmpfs output CRASHED THE PC — build on DISK, /var/tmp).
+- decode_step_size WORKS: 12-group engine, per-1k-context KV windows —
+  decode reads scale with ACTUAL ctx, not full cache (fixes the dense-
+  read issue by construction).
+- MEASURED (layer ladder + post, x28 + host 2ms):
+  ctx 1k: 15.8 t/s | 2k: 14.1 | 4k: 11.7 | 6k: 10.0 | 8k: 8.3 | 10k: 7.5
+- POST DOMINATES at 1.7B: full 151936-vocab post = 15.56ms (25% of
+  token @1k!). TRIM post (90.9k ids, 183MB): 8.24ms -> +1.5-2 t/s all ctx
+  (17.6 t/s @1k, 8.4 @10k). Engines: Pi /tmp/s17b (wipe on reboot).
+- NOT DONE (next): backend integration — ggml-axcl hardcodes 0.6B dims
+  (hidden 1024 anchors, 2KB KV rows); 1.7B needs hidden-2048 row sizes +
+  anchor filters + a Qwen3-1.7B GGUF for tokenizer. Numbers above are
+  layer-timing projections (the Phase-C method), not llama-simple e2e.
+
 ### SESSION CLOSE (2026-08-28 ~03:00) — EVERYTHING WORKING, ROOT CAUSES CLOSED
 1. **Batch-prefill "refusal" was OUR bug, not the driver's**: the chunk
    ladder's depth is build-dependent (vendor 10 groups = 1152-token
