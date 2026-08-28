@@ -152,6 +152,27 @@ broken" conclusion — not the engines.
 
 
 
+
+### BACKEND-INIT DEBUG COMPLETE (2026-08-28 early)
+1. VENDOR BUG (V3.10.2, clean repro): loading a `pulsar2 build` engine
+   AFTER any llm_build engine drops the PCIe device ("recv dma size 0").
+   Repro: multi_load <layer.axmodel> <post_trim.axmodel> -> instant
+   zero-byte DMA. Reverse order fine; standalone fine. WORKAROUND in
+   backend: heads load before the layer set. FILE WITH AXERA.
+2. The "corrupt" trim engine: first rebuild was written during the quota
+   crunch (rc=0 but garbage); ALSO built with the EndToEnd cfg = 372MB
+   f32 weights. Correct build: cfg_simple (MinMax) = 99MB int8.
+3. MY BUGS fixed (fork babca45): post IO names (input/output vs X/Y),
+   f32 vs bf16 logits (trim map count = ground truth), per-token retry
+   of failed post loads (4s/token), vocab64 stride guards.
+4. **Trimmed post (90.9k vocab): 26.77 t/s decode, zero errors** —
+   37.4ms = 32.7 layers + 4.7 post + host. Budget closes exactly.
+5. OPEN (next session): llama-lookup SIGSEGV in graph_compute on
+   all-logits batches (llama-simple immune; survives w/o vocab64 =>
+   NOT the head branch). gdb frame: graph_compute <- sched <-
+   process_ubatch <- llama_decode. Needs a -g build for the line.
+   Spec e2e blocked on this alone — every primitive now works.
+
 ### DRIVER UPGRADE + FINAL NUMBERS (2026-08-27 evening)
 - axcl V3.10.2 installed on the Pi (deb at ~/axcl_host_aarch64_V3.10.2*.deb;
   NOTE: new package ships UNVERSIONED libs — needed `for f in libaxcl_*.so;
