@@ -1,5 +1,7 @@
 # ggml-axcl — llama.cpp Axera NPU backend
 
+![demo: 24 t/s streaming with the Pi's CPU at ~1%](docs/demo.png)
+
 A custom [llama.cpp](https://github.com/ggml-org/llama.cpp) backend (`ggml-axcl`) that runs
 Qwen3-0.6B **directly from GGUF** on an Axera AX8850 NPU accelerator card
 (M5Stack LLM-8850: 24 TOPS INT8, 8 GB LPDDR4x) hosted on a Raspberry Pi 5.
@@ -11,7 +13,9 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
-| **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt) | int4 g128 | **24.3 t/s** | **~700 t/s** (chunked) | **~0%** | ~0.8 GB |
+| **s4 kv1024** (llm_build2 s4, 1k ctx cap) | int4 g128 | **29.9 t/s** | ~700 t/s (chunked) | **~0%** | ~0.6 GB |
+| **s4 + trimmed post** (90.9k vocab head) | int4 g128 | **26.8 t/s** | ~700 t/s (chunked) | **~0%** | ~0.8 GB |
+| **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **~700 t/s** (chunked) | **~0%** | ~0.8 GB |
 | **GGUF-int8 mode** (GGUF weights patched into int8 w8a16 engines) | q8_0 | **19.5 t/s** | 18.1 t/s | **~0%** | **1.1 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | q8_0 | **19.7 t/s** | 18.5 t/s | **2%** of one core | **1.3 GB** |
 | Vendor-engine mode (int8 w8a16 engines, engines' own weights) | Q4_K_M | **19.6 t/s** | 18.3 t/s | **2%** of one core | **1.3 GB** |
@@ -27,10 +31,13 @@ Vendor-engine mode quant column = the GGUF supplying tokenizer/graph/
 sampling; model compute is identical for both quants (engines carry their
 own weights), which the numbers confirm.
 
-**Headline: at 19.5 tokens/s with the host CPU idle, GGUF weights run on
-the int8 NPU path — the fastest mode now carries the GGUF's own weights
-(beating the vendor's closed runtime at 13.5–14.5 t/s on the same card),
-with the best fidelity of any NPU mode (96% token agreement).**
+**Headline: 24.5 t/s decode at 2k context (29.9 t/s with a 1k-context
+build, 26.8 with a trimmed vocab head) on int4 s4 engines, prompt
+processing at 716 t/s — all with the Pi's CPU idle, and every engine on
+the card loaded straight from GGUF-serving tooling. The GGUF-int8 mode
+below additionally patches the GGUF's own weights into int8 engines
+(96% token agreement) — beating the vendor's closed runtime (13.5–14.5
+t/s on the same card) in every mode.**
 
 Fidelity (greedy prefix-token agreement vs the CPU reference of the same
 GGUF, 10 prompts × 24 tokens): **GGUF-int8 mode q8_0 96%**; vendor-engine
