@@ -3,8 +3,9 @@
 ![demo: 24 t/s streaming with the Pi's CPU at ~1%](docs/demo.png)
 
 A custom [llama.cpp](https://github.com/ggml-org/llama.cpp) backend (`ggml-axcl`) that runs
-Qwen3-0.6B **directly from GGUF** on an Axera AX8850 NPU accelerator card
-(M5Stack LLM-8850: 24 TOPS INT8, 8 GB LPDDR4x) hosted on a Raspberry Pi 5.
+Qwen3-0.6B and Qwen3.5-0.8B (text + vision) **directly from GGUF** on an
+Axera AX8850 NPU accelerator card (M5Stack LLM-8850: 24 TOPS INT8, 8 GB
+LPDDR4x) hosted on a Raspberry Pi 5.
 
 **The GGUF is the only model artifact.** At load time the GGUF's weights are
 dequantized and patched into pre-compiled whole-layer NPU engines — no model
@@ -13,7 +14,7 @@ same code path.
 
 | Mode | Quant | decode | prefill* | CPU load | card CMM |
 |---|---|---|---|---|---|
-| **Qwen3.5-0.8B hybrid** (18 delta-net + 6 attn layers, chunk ladder) | any GGUF | **27.0 t/s** flat @2k ctx | **121–201 t/s** (ladder) | **~0%** | **0.9 GB** |
+| **Qwen3.5-0.8B hybrid** (18 delta-net + 6 attn layers, chunk ladder, **vision on NPU**) | any GGUF | **27.0 t/s** flat @2k ctx | **111–201 t/s** (ladder) | **~0%** | **0.9 GB** |
 | s4 kv1024 (1k ctx cap) *(axcl V3.10.2 stack)* | int4 g128 | 29.9 t/s | ~700 t/s (chunked) | **~0%** | ~0.6 GB |
 | s4 + trimmed post (90.9k vocab) *(axcl V3.10.2 stack)* | int4 g128 | 26.8 t/s | ~700 t/s (chunked) | **~0%** | ~0.8 GB |
 | **s4-GPTQ mode** (llm_build2 s4 engines from a GPTQ-g128 ckpt, 2k ctx) | int4 g128 | **24.5 t/s** | **1,276 t/s** (chunked) | **~0%** | ~0.8 GB |
@@ -110,8 +111,8 @@ Notes:
 
   | | decode @300 ctx | decode @2k ctx | prefill (11-group ladder) | peak CMM |
   |---|---|---|---|---|
-  | Q4_K_M GGUF | 27.00 t/s | 27.05 t/s | 121 t/s @608 tok, 201 @1147 | 895 MiB |
-  | Q8_0 GGUF | 26.95 t/s | 26.98 t/s | 119 t/s @608 tok | 895 MiB |
+  | Q4_K_M GGUF | 26.98 t/s | 26.97 t/s | 111 t/s @608 tok, 199–201 @1147 | 895 MiB |
+  | Q8_0 GGUF | 26.70 t/s | 26.83 t/s | 118 t/s @608 tok | 895 MiB |
 
   Decode is **flat with context** (27 t/s at 300 and at 2000 tokens): 18 of
   24 layers are linear-attention with fixed state — no KV growth. 895 MiB
@@ -125,25 +126,46 @@ Notes:
   crash-free (this shape segfaulted before the KV-flush value-snapshot
   fix). Quality eval (`gemm/q35_eval.sh`, 12 cases): 7/12 Q4_K_M, 6/12
   Q8_0 — strong on direct facts (capitals, primes, 12÷3, entity tracking,
-  translation), misses on some world knowledge (planet order, Moby-Dick
-  author, 17+25) — consistent with a 0.8B reasoning model under greedy
-  decoding; scores are quant-invariant (same engine weights).
+  translation, color naming), misses on some world knowledge (planet
+  order, Moby-Dick author, 17+25) — consistent with a 0.8B reasoning
+  model under greedy decoding; scores are quant-invariant (same engine
+  weights). Full per-case results in `gemm/` output logs.
 
   **Vision (Qwen3.5 is multimodal) — WORKING, tower on the NPU:**
   `gemm/axcl_vision.c` drives the vendor's compiled
   `qwen3_5_vision.axmodel` — the Qwen3-VL pixel-block packing ported
-  verbatim from the vendor runtime, 384×384 u8 → [144,1024] embeddings in
-  **45 ms/image on the card** (~54 s on the Pi CPU — ~1200×). The
-  embeddings splice into the NPU text stack via mtmd
-  (`GGML_AXCL_NPU_VISION_EMBD=...`), M-RoPE grids consistent, and the
-  model generates correct image descriptions end-to-end (verified on
-  llama.cpp's test-1.jpeg: *"a high-resolution image of a collection of
-  Arabic calligraphy..."*). Quick start:
-  `./axcl_vision img.jpg qwen3_5_vision.axmodel /tmp/e.bin` then
-  `llama-mtmd-cli --mmproj mmproj-BF16.gguf --no-mmproj-offload
-  GGML_AXCL_NPU_VISION_EMBD=/tmp/e.bin --image img.jpg -m model.gguf -p ...`.
-  Known issue (cosmetic): process aborts at exit via a double-free in
-  scheduler teardown AFTER output completes.
+  verbatim from the vendor runtime (384×384 u8, temporal dup, merge-block
+  repack), input `[1,576,512,3]` → `pooler_output [144,1024]`.
+
+  | stage | time | where |
+  |---|---|---|
+  | tower encode | **45 ms** | NPU (vs 53.8 s CPU mmproj — ~1200×) |
+  | embedding splice | 1–2 ms | host |
+  | text decode | 27 t/s | NPU |
+  | E2E (load + encode + 60 tokens) | ~34 s | dominated by engine load |
+
+  Descriptions are correct for photographic content (llama.cpp's
+  test-1.jpeg: *"a person standing in a large, open, and bright space"*,
+  the astronaut photo); solid-color synthetic images can misidentify
+  colors (the CPU mmproj reference misidentifies the same images —
+  0.8B-model limitation at fixed 384×384 resolution, not a pipeline bug).
+  Quick start:
+
+  ```bash
+  # 1. encode the image on the card (45 ms)
+  ./axcl_vision image.jpg Qwen3.5-0.8B-int4/qwen3_5_vision.axmodel /tmp/e.bin
+  # 2. describe it — NPU embeddings + NPU text decode, CPU only tokenizes
+  GGML_AXCL_NPU_VISION_EMBD=/tmp/e.bin llama-mtmd-cli \
+      --mmproj mmproj-BF16.gguf --no-mmproj-offload \
+      --image image.jpg -m Qwen3.5-0.8B-Q4_K_M.gguf -p "Describe this image."
+  ```
+
+  The mmproj GGUF is still loaded (llama.cpp's mtmd harness needs its
+  metadata/token plumbing) but its tower is bypassed — `--no-mmproj-offload`
+  keeps it on CPU where its encode call is short-circuited by the NPU
+  embeddings. Known cosmetic issue: none remaining (the exit-time abort
+  was a zero-row probe-graph logits write — fixed and valgrind-verified
+  clean; mtmd-cli exits 0).
 
   **MTP (multi-token prediction):** Qwen3.5 ships a trained NextN/MTP head
   and this llama.cpp fork supports `--spec-type draft-mtp`. NOT enabled on
@@ -361,17 +383,31 @@ Full research log: `NOTES-DYNAMIC-WEIGHTS.md`.
 - `gemm/vendor_trace.c` — LD_PRELOAD tracer for vendor runtime IO conventions
 - `gemm/chain_test.c` + `gemm/ref_chain.py` — engine-chain vs numpy reference
 
-## Known issues (2026-08-28 card incident)
+## Known issues
 
-After a session with several abnormal process deaths (a segfault since
-fixed, SIGKILL timeouts), the card entered a state where the **0.6B s4
-chunk-ladder mode** faults the runtime memory service (`memory memcpy nil
-pointer`) or computes garbage — on every code variant tested, including the
-historically-verified one, while per-token s4, the vendor 0.6B set, and the
-entire Qwen3.5 stack (incl. its own chunk ladder) run correctly. Treat it as
-card-state damage, not code: the regression suite gates the s4 chunk cases
-behind `S4_CHUNK=1` until the card is firmware-recovered. The same incident
-taught the stability rules below (SIGINT-first teardown, execute-canaries).
+**0.6B s4 chunk-ladder mode** (`GGML_AXCL_BATCH=1` with the llm_build2 s4
+engine set): faults the driver's memory service (`memory memcpy nil
+pointer`). ROOT CAUSE IDENTIFIED (not card damage as first suspected):
+the s4 llm_build2 engines use a **64-token chunk ladder** (probed: group-1
+input 131072 B = 64×1024×2, mask 64×64, indices 64 u32) while the backend
+historically hardcoded 128-token chunks — every bind was 2× oversized.
+An adaptive engine-derived chunk size is implemented (probes group-1 input
+size at load; the loader now correctly reports "3 shape groups, 64-token
+chunk ladder") but one binding mismatch remains to find — a standalone
+probe with API-exact binds executes the same engine cleanly, proving the
+fault is in the backend's dispatch path, not the hardware. The vendor
+0.6B set (128-token ladder, `~/Qwen3-0.6B`) and the entire Qwen3.5 stack
+(128-token ladder) are unaffected. The regression suite gates the s4 chunk
+cases behind `S4_CHUNK=1` until this lands. Per-token s4 decode and the
+vendor 0.6B mode work correctly.
+
+**Card-state management** (design constraint, not a bug): the AX8850's
+device-side state survives process death and host driver reloads. Any
+abnormal termination with engine work in flight (SIGKILL, segfault) can
+wedge the card — its firmware only resets on PCIe power removal. The
+regression suite's SIGINT-first teardown discipline prevents the suite
+itself from causing this; external crashes still can. Recovery ladder:
+zombie sweep → ordered driver reload → wall power (last resort).
 
 ## Regression suite
 
