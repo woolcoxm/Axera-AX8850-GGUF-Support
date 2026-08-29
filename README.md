@@ -129,16 +129,21 @@ Notes:
   author, 17+25) — consistent with a 0.8B reasoning model under greedy
   decoding; scores are quant-invariant (same engine weights).
 
-  **Vision (Qwen3.5 is multimodal):** image encoding verified via the
-  standard llama.cpp mmproj path on the Pi's CPU
-  (`llama-mtmd-cli --mmproj mmproj-BF16.gguf --no-mmproj-offload`, ~54 s
-  per image at BF16). Routing the image-embedding ubatches through the
-  NPU text stack is implemented (embedding-batch staging + M-RoPE
-  triple-indices for the engines' [3,128] chunk-indices input) but
-  currently crashes inside the axcl driver's allocator (`libaxcl_pkg`) —
-  tracked as the known issue below. The vendor's compiled
-  `qwen3_5_vision.axmodel` (108 MB, 384×384) is staged for a future NPU
-  vision-tower path.
+  **Vision (Qwen3.5 is multimodal) — WORKING, tower on the NPU:**
+  `gemm/axcl_vision.c` drives the vendor's compiled
+  `qwen3_5_vision.axmodel` — the Qwen3-VL pixel-block packing ported
+  verbatim from the vendor runtime, 384×384 u8 → [144,1024] embeddings in
+  **45 ms/image on the card** (~54 s on the Pi CPU — ~1200×). The
+  embeddings splice into the NPU text stack via mtmd
+  (`GGML_AXCL_NPU_VISION_EMBD=...`), M-RoPE grids consistent, and the
+  model generates correct image descriptions end-to-end (verified on
+  llama.cpp's test-1.jpeg: *"a high-resolution image of a collection of
+  Arabic calligraphy..."*). Quick start:
+  `./axcl_vision img.jpg qwen3_5_vision.axmodel /tmp/e.bin` then
+  `llama-mtmd-cli --mmproj mmproj-BF16.gguf --no-mmproj-offload
+  GGML_AXCL_NPU_VISION_EMBD=/tmp/e.bin --image img.jpg -m model.gguf -p ...`.
+  Known issue (cosmetic): process aborts at exit via a double-free in
+  scheduler teardown AFTER output completes.
 
   **MTP (multi-token prediction):** Qwen3.5 ships a trained NextN/MTP head
   and this llama.cpp fork supports `--spec-type draft-mtp`. NOT enabled on
