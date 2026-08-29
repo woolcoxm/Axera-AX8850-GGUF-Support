@@ -1,5 +1,50 @@
 # int4lab FINDINGS (session 2026-08-27, Phase R)
 
+## SESSION (2026-08-29) — "device 0 is not connected" ROOT-CAUSED + SOFTWARE CARD RESET FOUND
+1. **The error is two different things**: (a) transient — the device manager
+   hasn't enumerated the card yet (boot / post-driver-reload race); the old
+   backend probed GetDeviceList ONCE and then did axclrtSetDevice(0) on a
+   nonexistent device — which is literally the string the runtime prints.
+   (b) the wedger — a process death with work in flight (SIGKILL mid-execute,
+   crash, engine-load failure) drops/wedges the card; every later process
+   gets (a)'s error until wall power (bug report #3 pattern).
+2. **THE DISCOVERY**: axclhost 3.6.5-m5stack1 (our current driver-good stack)
+   exports `axclrtRebootDevice` + `axclrtRegisterDeviceStatusCallback`
+   (libaxcl_rt.so, nm-verified). axcl_rt_device.h documents the exact
+   pattern: on AXCL_DEVICE_STATUS_OFFLINE → axclrtRebootDevice(device).
+   This IS the "EP-panic card reset" we spotted in V3.10.2's axcl-smi and
+   never tested — it was under our feet the whole time as an API. Wall-power
+   cycles were never necessary for the card-side reset.
+3. **Backend hardened** (ggml-axcl.cpp): OFFLINE callback → auto
+   axclrtRebootDevice + fail-fast (never submit to a dead channel);
+   bounded connect-wait (GGML_AXCL_CONNECT_TIMEOUT, 15s default) for the
+   enumeration race; SIGTERM graceful (stop between engine calls, 10s death
+   deadline) + best-effort finalize on SEGV/ABRT/BUS/FPE with alarm
+   watchdog; partial-activation context leak fixed (leaked ctx + worker
+   threads aborted during exit WITH the device held — wedge vector of its
+   own). All env-gated: GGML_AXCL_AUTO_REBOOT / GGML_AXCL_SIGNAL_GUARD=0.
+4. **card_tools/**: card_reboot.c (axclrtRebootDevice wrapper, build on Pi),
+   card_reset.sh (zombies → EP reboot → driver reload → EP reboot → PCI
+   remove/rescan → FLR/secondary-bus reset PERST# → POWER_CMD), wait_card.sh.
+   regression_suite recover() now runs that ladder before BLACK.
+5. VERIFIED ON THE PI (2026-08-29, stack 3.6.5-m5stack1 + 3.6.6 pac):
+   (1) `axclrtRebootDevice(3) ... OK` — the EP software reboot works; card
+   back in smi within seconds. Device index is 3 (switch-topology HAT),
+   confirming the old SetDevice(0) fallback was doubly wrong.
+   (2) Hardened backend rebuilt + run: byte-identical output, 26.96 t/s vs
+   27.10 t/s original (noise). NOTE: llama-simple NEEDS the full suite env
+   (GGML_AXCL_FA=1 GGML_AXCL_STREAM=1) — without them the graph takes the
+   per-op path and dies at "SSM_CONV not supported" (pre-existing, both
+   backends, not a regression — bit us during verification).
+   (3) WEDGE DRILL: SIGKILL mid-load (CMM 204 MiB in-flight) AND mid-decode
+   (16.9s, generating) — card survived BOTH (canary green each time). The
+   "driver-good" stack shrugs off the classic wedge vectors; the 08-27
+   wedges were on V3.10.2-era stacks. card_reset.sh ladder stays as
+   insurance for devices that do wedge (and its EP-reboot rung is proven).
+   (4) card_reset.sh -y on healthy card: correct no-op. wait_card.sh OK.
+   UNTESTED BY CHOICE: PERST# secondary-bus-reset rung on a healthy card
+   (didn't want to risk the last resort without a wedge to recover from).
+
 ## The w4 landscape (measured, not guessed)
 - `pulsar2 llm_build2 -w s4` = REAL 4-bit weights: Qwen3-0.6B layer engine
   s4 = 9,504,061 B vs s8 = 17,931,805 B (53.0%). Vendor 5.2 w8a16 = 23.1 MB.

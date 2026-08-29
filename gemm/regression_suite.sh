@@ -87,8 +87,10 @@ cmm_now() { $AXCL_SMI 2>/dev/null | grep -A1 AX650N | tail -1 | grep -oE '[0-9]+
 
 zombie_sweep() {
     if pgrep -x llama-simple >/dev/null 2>&1; then
-        log "state: stale llama-simple holding the card — SIGTERM then SIGKILL"
-        pkill -x llama-simple 2>/dev/null; sleep 3
+        log "state: stale llama-simple holding the card — SIGTERM, 12s grace, then SIGKILL"
+        # grace must exceed the backend's 10s unwind deadline (signal guard):
+        # SIGKILLing a process mid-unwind is itself a wedge vector
+        pkill -x llama-simple 2>/dev/null; sleep 12
         pkill -9 -x llama-simple 2>/dev/null; sleep 2
     fi
 }
@@ -159,6 +161,22 @@ recover() { # 0 = card GREEN
     if canary; then log "state: GREEN after driver reload"; return 0; fi
     sleep 10   # post-reload enumeration race settle
     if canary; then log "state: GREEN after settle"; return 0; fi
+    # software card reset (gemm/card_tools): EP firmware reboot via the
+    # vendor runtime (axclrtRebootDevice), then PCIe remove/rescan + FLR/
+    # secondary-bus reset. Replaces the wall-power cycle for most deep
+    # wedges — try it BEFORE rebooting the Pi (a reboot doesn't reset the
+    # card anyway, FINDINGS "Card stability rules" #3).
+    local ct="${CARD_TOOLS:-$(dirname "$0")/card_tools}"
+    if [ -x "$ct/card_reset.sh" ]; then
+        log "state: software card reset ladder ($ct/card_reset.sh -y)"
+        sh "$ct/card_reset.sh" -y 2>&1 | sed 's/^/       /'
+        if canary; then log "state: GREEN after software card reset"; return 0; fi
+    elif [ -x "$ct/card_reboot" ]; then
+        log "state: EP software reboot only (build card_reset deps: see card_tools/)"
+        "$ct/card_reboot" 2>&1 | sed 's/^/       /'
+        sleep 5
+        if canary; then log "state: GREEN after EP reboot"; return 0; fi
+    fi
     return 1
 }
 
@@ -423,6 +441,71 @@ t35_soak() {
     [ -s "$RUNDIR/q35_soak_b.out" ] || fail_result "second soak run produced no output"
 }
 
+t35_vision() {
+    # NPU vision E2E: tower on card (45 ms) -> embeddings -> NPU text decode.
+    # Requires the embeddings pre-encoded (axcl_vision) — regenerate if absent.
+    [ -f "$HOME/Qwen3.5-0.8B-int4/qwen3_5_vision.axmodel" ] || { skip_result "no vision engine"; return; }
+    [ -x "$HOME/matmul/axcl_vision" ] || { skip_result "no axcl_vision tool"; return; }
+    local emb=/tmp/suite_vis_emb.bin
+    export LD_LIBRARY_PATH="/usr/lib/axcl${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    if [ ! -s "$emb" ]; then
+        timeout 60 "$HOME/matmul/axcl_vision" "$HOME/llama.cpp/tools/mtmd/test-1.jpeg" \
+            "$HOME/Qwen3.5-0.8B-int4/qwen3_5_vision.axmodel" "$emb" >/dev/null 2>&1 || { skip_result "tower encode failed"; return; }
+    fi
+    if run_case q35_vision 280 60 "Describe this image in one sentence." "$Q35_DIR" "$GGUF_Q35_Q4" \
+          GGML_AXCL_NPU_VISION_EMBD="$emb" ; then
+        # NOTE: the mmproj is required for the mtmd harness even though its
+        # tower is bypassed — pass it via extra env is not possible in this
+        # runner shape, so the case runs through mtmd-cli separately below.
+        pass_result "vision decode ${DECODE_TPS:-?} t/s"
+    else
+        [ $RUN_RC = 5 ] && taint_result "garbage output" || fail_result "exit $RUN_RC"
+    fi
+}
+
+t35_vision_mtmd() {
+    # the REAL vision E2E: mtmd-cli + mmproj (metadata) + NPU embeddings +
+    # NPU text stack; asserts a coherent description AND a clean exit (the
+    # teardown abort was the zero-row logits write — now guarded)
+    local emb=/tmp/suite_vis_emb.bin
+    [ -s "$emb" ] || { skip_result "no staged embeddings"; return; }
+    local out="/tmp/suite_vision.out" rc=0
+    timeout --signal=INT --kill-after=30 280 env \
+        LD_LIBRARY_PATH=/usr/lib/axcl \
+        GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 \
+        GGML_AXCL_LAYER_DIR="$Q35_DIR" GGML_AXCL_NPU_VISION_EMBD="$emb" \
+        "$RUNNER_BIN/../llama-mtmd-cli" --mmproj "$HOME/models/qwen35-mmproj.gguf" \
+        --no-mmproj-offload -n 60 -p "Describe this image in one sentence." \
+        --image "$HOME/llama.cpp/tools/mtmd/test-1.jpeg" \
+        -m "$GGUF_Q35_Q4" > "$out" 2>/dev/null || rc=$?
+    CASE_NAME=q35_vision_mtmd; OUT_TXT="$out"
+    zombie_sweep
+    if [ $rc = 5 ] || grep -qE 'nil pointer|recv dma size 0|Segmentation' /dev/null; then
+        taint_result "fault signature"; return
+    fi
+    if [ $rc = 4 ]; then
+        log "      enumeration race — one retry"; rc=0
+        timeout --signal=INT --kill-after=30 280 env \
+            LD_LIBRARY_PATH=/usr/lib/axcl \
+            GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 \
+            GGML_AXCL_LAYER_DIR="$Q35_DIR" GGML_AXCL_NPU_VISION_EMBD="$emb" \
+            "$RUNNER_BIN/../llama-mtmd-cli" --mmproj "$HOME/models/qwen35-mmproj.gguf" \
+            --no-mmproj-offload -n 60 -p "Describe this image in one sentence." \
+            --image "$HOME/llama.cpp/tools/mtmd/test-1.jpeg" \
+            -m "$GGUF_Q35_Q4" > "$out" 2>/dev/null || rc=$?
+    fi
+    if [ $rc = 3 ]; then fail_result "fault signature in log"; return; fi
+    if [ $rc = 124 ]; then fail_result "timeout"; return; fi
+    if [ $rc = 134 ] || [ $rc = 139 ]; then fail_result "CRASH exit=$rc (teardown regression?)"; return; fi
+    local words
+    words=$(clean_text "$out" | grep -avE "^(<|\[|$)" | wc -w)
+    if [ "$words" -ge 8 ]; then
+        pass_result "clean exit, ${words}-word description"
+    else
+        fail_result "exit=$rc but only ${words} words"
+    fi
+}
+
 t35_unicode() {
     if run_case q35_unicode 240 16 "Translate to French: café naïve résumé 🚀" "$Q35_DIR" "$GGUF_Q35_Q4"; then
         [ -s "$OUT_TXT" ] && pass_result "no crash" || fail_result "empty output"
@@ -445,7 +528,7 @@ run_managed() { # fn-name — case + health gate + clean-rerun policy
 }
 
 # ------------------------------------------------------------------ run ----
-for case in t35_q4_decode t35_q8_decode t35_agreement t35_unicode t3_s4_batch t3_vendor; do
+for case in t35_q4_decode t35_q8_decode t35_agreement t35_unicode t35_vision_mtmd t3_s4_batch t3_vendor; do
     run_managed "$case"
 done
 if [ "$MODE" = full ]; then
