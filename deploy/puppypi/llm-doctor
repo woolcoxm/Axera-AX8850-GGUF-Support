@@ -4,7 +4,8 @@
 #   llm-doctor --recover  # card/driver acting up? reload the driver module stack
 set -u
 PREFIX=/opt/llm
-PORT="${LLM_SERVER_HOST:-127.0.0.1:8080}"
+PORT="${LLM_SERVER_HOST:-$(grep -oE '127.0.0.1:[0-9]+' /etc/profile.d/llm.sh 2>/dev/null | head -1)}"
+PORT="${PORT:-127.0.0.1:8081}"
 
 ok()   { echo "  [ok]   $*"; }
 bad()  { echo "  [FAIL] $*"; rc=1; }
