@@ -1,0 +1,8 @@
+#!/bin/sh
+# llm-ask — talk to the robot's LLM (llama-server, OpenAI-compatible API)
+#   llm-ask "Name three planets."
+#   llm-ask                 # interactive chat
+#   LLM_SERVER_HOST=10.0.0.81:8080 llm-ask "hi"   # query a remote server
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+exec "$PY" /opt/llm/robot/llm.py "$@"

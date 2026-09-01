@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# llm-doctor — health check + recovery for the robot's LLM stack.
+#   llm-doctor            # check everything
+#   llm-doctor --recover  # card/driver acting up? reload the driver module stack
+set -u
+PREFIX=/opt/llm
+PORT="${LLM_SERVER_HOST:-127.0.0.1:8080}"
+
+ok()   { echo "  [ok]   $*"; }
+bad()  { echo "  [FAIL] $*"; rc=1; }
+info() { echo "  [--]   $*"; }
+rc=0
+
+echo "== host =="
+info "$(tr -d '\0' < /proc/device-tree/model 2>/dev/null), $(uname -m), kernel $(uname -r)"
+info "free disk: $(df -h / | tail -1 | awk '{print $4}')"
+
+echo "== NPU card =="
+if [ -e /dev/axcl_host ]; then
+    ok "/dev/axcl_host present"
+    [ -x /usr/bin/axcl/axcl-smi ] && /usr/bin/axcl/axcl-smi 2>/dev/null | head -6
+else
+    bad "/dev/axcl_host missing — card absent or driver not loaded"
+    if lsmod | grep -q axcl_host; then info "driver module is loaded"; else info "driver module NOT loaded"; fi
+fi
+
+echo "== service =="
+if systemctl is-active --quiet llm-serve; then
+    ok "llm-serve active (listening on $PORT)"
+else
+    bad "llm-serve not active: $(systemctl is-active llm-serve)"
+    info "recent log: journalctl -u llm-serve -n 20"
+fi
+
+echo "== API =="
+if curl -fs -m 3 "http://$PORT/health" >/dev/null 2>&1; then
+    ok "GET /health"
+else
+    bad "GET http://$PORT/health failed (LLM_SERVER_HOST=$PORT)"
+fi
+
+echo
+if [ "${1:-}" = "--recover" ]; then
+    echo "== recovery: reloading the AXCL driver module stack =="
+    echo "  (stopping llm-serve first — never kill it mid-engine-load; this is the"
+    echo "   documented fix for an early PCIe wedge. A deep wedge needs a full"
+    echo "   POWER-OFF of the card — a reboot alone does not reset it.)"
+    systemctl stop llm-serve
+    sleep 2
+    for m in axcl_host ax_pcie_host_dev ax_pcie_p2p_rc ax_pcie_mmb ax_pcie_msg; do
+        modprobe -r "$m" 2>/dev/null && echo "  unloaded $m"
+    done
+    sleep 2
+    for m in ax_pcie_msg ax_pcie_mmb ax_pcie_p2p_rc ax_pcie_host_dev axcl_host; do
+        modprobe "$m" 2>/dev/null && echo "  loaded   $m"
+    done
+    systemctl start llm-serve
+    echo "  llm-serve restarted; watch it come up with: journalctl -u llm-serve -f"
+elif [ $rc -ne 0 ]; then
+    echo "something failed — try: llm-doctor --recover"
+fi
+exit $rc

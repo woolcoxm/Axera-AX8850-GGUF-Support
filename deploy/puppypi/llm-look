@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# llm-look — ask the LLM about an image (NPU vision tower when available).
+#   llm-look image.jpg "What do you see?"
+#   libcamera-still -o /tmp/snap.jpg -n && llm-look /tmp/snap.jpg "Describe this."
+set -u
+PREFIX=/opt/llm
+IMG="${1:?usage: llm-look <image.jpg> [prompt]}"
+PROMPT="${2:-Describe this image in two sentences.}"
+MODEL="$PREFIX/models/Qwen3.5-0.8B-Q4_K_M.gguf"
+MMPROJ="$PREFIX/models/mmproj-BF16.gguf"
+EDIR="$PREFIX/engines/Qwen3.5-0.8B-AX650-GPTQ-Int4"
+
+[ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 1; }
+[ -f "$MMPROJ" ] || { echo "mmproj missing ($MMPROJ) — vision not installed" >&2; exit 1; }
+
+if [ -x "$PREFIX/bin/axcl_vision" ] && [ -d "$EDIR" ]; then
+    # NPU path: encode on the card (~45 ms), decode on the card
+    EMBD=$(mktemp /tmp/embd-XXXX.bin)
+    trap 'rm -f "$EMBD"' EXIT
+    "$PREFIX/bin/axcl_vision" "$IMG" "$EDIR/qwen3_5_vision.axmodel" "$EMBD" || exit 1
+    exec env GGML_AXCL_LAYER=1 GGML_AXCL_FA=1 GGML_AXCL_STREAM=1 \
+        GGML_AXCL_LAYER_DIR="$EDIR" GGML_AXCL_NPU_VISION_EMBD="$EMBD" \
+        "$PREFIX/build/bin/llama-mtmd-cli" \
+        --mmproj "$MMPROJ" --no-mmproj-offload --image "$IMG" \
+        -m "$MODEL" -p "$PROMPT" --temp 0.7
+else
+    # CPU fallback: the mmproj tower runs on the Pi's CPU (slow: tens of seconds)
+    exec "$PREFIX/build/bin/llama-mtmd-cli" \
+        --mmproj "$MMPROJ" --image "$IMG" \
+        -m "$MODEL" -p "$PROMPT" --temp 0.7
+fi
