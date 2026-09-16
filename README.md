@@ -51,7 +51,29 @@ one model near-miss completion, one eval-script quirk that "fails"
 healthy lexical diversity); vendor-engine mode scores 7/8 but diverges
 from the reference on the arithmetic near-miss.
 
+## Any-GGUF branch (MarkOS integration)
+
+Branch **`axera-any-gguf`** of the llama.cpp fork generalizes the backend
+beyond the PoC's fixed qwen3-0.6B geometry:
+
+- **runtime geometry** — every hardwired constant (hidden 1024, vocab
+  151936, 28 layers, q 2048/kv 1024/ff 3072/head 128, 64-layer caps) is
+  discovered from the live compute graph and the loaded engines' IO dims
+- **engine sets** — whole-layer template sets described by `set.txt`
+  manifests (`family`, `pattern`, `post`, `layout`, `hidden`, `vocab`,
+  `layers`, `ctx`) under a sets root, selected by geometry match
+  (see `gemm/engine_sets/set.txt.example`)
+- **serving ladder** — a GGUF whose geometry matches a set runs
+  whole-layer on the NPU; anything else still loads and runs (per-op
+  shape-keyed matmul engines, else the CPU reference). No
+  model-specific hardcoding remains in the serving path.
+
+MarkOS consumes this branch via its `axcl` engine feature; see
+`MarkOS/docs/axera.md`. The PoC branch remains the hardware-proven
+reference for the qwen3-0.6B set.
+
 ## Quick start
+
 
 On the **Pi** (kram@10.0.0.81 in this setup; any aarch64 host with the AXCL
 driver works):
