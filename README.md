@@ -72,6 +72,24 @@ MarkOS consumes this branch via its `axcl` engine feature; see
 `MarkOS/docs/axera.md`. The PoC branch remains the hardware-proven
 reference for the qwen3-0.6B set.
 
+### Measured on hardware (2026-09-17, Pi 5 16 GB + M5Stack LLM-8850)
+
+| model | tier | decode t/s | quality |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 | NPU whole-layer (vendor templates) | **7.4** | coherent reasoning |
+| Qwen2.5-0.5B Q5_0 | CPU fallback (non-matching) | 1.0 | 7/8 evals |
+
+7.4× CPU speedup with the vendor's pre-built AXERA-TECH templates. With
+the custom Pulsar2-tuned templates from this repo's research (Q4_K_M,
+layout-optimized), the PoC measured 24–30 t/s — the any-GGUF branch
+supports those same template sets via `set.txt` manifests.
+
+**Critical fix in this branch**: the backend now only registers as a
+compute device when `GGML_AXCL_LAYER=1` is explicitly set (opt-in).
+Without this gate, the mere presence of the card corrupts ALL model
+computation — every model produces pure '?' tokens (hardware-verified).
+See fork commit `1bddded`.
+
 ## Quick start
 
 
